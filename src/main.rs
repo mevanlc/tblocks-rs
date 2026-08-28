@@ -1,5 +1,6 @@
 use std::io::{self, stdout};
 
+use clap::Parser;
 use ratatui::{
     Frame,
     buffer::Buffer,
@@ -21,16 +22,26 @@ const GRID_HEIGHT: u16 = 9;
 const APP_WIDTH: u16 = 39;
 const APP_HEIGHT: u16 = 13;
 
+#[derive(Debug, Parser)]
+#[command(version, about = "Build Unicode terminal block characters")]
+struct Cli {
+    /// Scale the selected vertical bounds to each output character's height
+    #[arg(long)]
+    scaling: bool,
+}
+
 fn main() -> io::Result<()> {
+    let cli = Cli::parse();
     ratatui::run(|terminal| {
         let _mouse_capture = MouseCapture::enable()?;
-        App::default().run(terminal)
+        App::new(cli.scaling).run(terminal)
     })
 }
 
 #[derive(Default)]
 struct App {
     cells: [[bool; 2]; 4],
+    scaling: bool,
     last_cell_action: Option<CellAction>,
     grid_area: Option<Rect>,
     select_all_area: Option<Rect>,
@@ -44,6 +55,13 @@ enum CellAction {
 }
 
 impl App {
+    fn new(scaling: bool) -> Self {
+        Self {
+            scaling,
+            ..Self::default()
+        }
+    }
+
     fn run(&mut self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
         while !self.should_quit {
             terminal.draw(|frame| self.render(frame))?;
@@ -88,24 +106,18 @@ impl App {
             layout.select_all,
         );
 
-        let octant = octant_glyph(self.mask());
-        let sextant = SEXTANTS[usize::from(vertically_scaled_mask(&self.cells, 3))];
-        let quadrant_mask = vertically_scaled_mask(&self.cells, 2);
-        let quadrant = QUADRANTS[usize::from(quadrant_mask)];
-        let halfblock = halfblock_output(quadrant_mask);
-        let outputs = Paragraph::new(format!(
-            "Octant    {octant} U+{:04X}\n\n\
-             Sextant   {sextant} U+{:04X}\n\n\
-             Quadrant  {quadrant} U+{:04X}\n\n\
-             Halfblock {halfblock}",
-            octant as u32, sextant as u32, quadrant as u32,
-        ))
-        .style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .block(Block::new().title(" Outputs ").borders(Borders::ALL));
+        let (output_title, output_text) = if self.scaling {
+            (" Scaled outputs ", scaled_outputs_text(&self.cells))
+        } else {
+            (" Exact outputs ", exact_outputs_text(self.mask()))
+        };
+        let outputs = Paragraph::new(output_text)
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(Block::new().title(output_title).borders(Borders::ALL));
         frame.render_widget(outputs, layout.outputs);
 
         frame.render_widget(
@@ -152,13 +164,7 @@ impl App {
     }
 
     fn mask(&self) -> u8 {
-        self.cells
-            .iter()
-            .flatten()
-            .enumerate()
-            .fold(0, |mask, (index, filled)| {
-                mask | (u8::from(*filled) << index)
-            })
+        cells_mask(&self.cells)
     }
 
     fn select_all_text(&self) -> &'static str {
@@ -197,6 +203,94 @@ impl App {
             CellAction::Clear
         });
     }
+}
+
+fn cells_mask(cells: &[[bool; 2]; 4]) -> u8 {
+    cells
+        .iter()
+        .flatten()
+        .enumerate()
+        .fold(0, |mask, (index, filled)| {
+            mask | (u8::from(*filled) << index)
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CharacterOutput {
+    name: &'static str,
+    glyph: char,
+}
+
+fn exact_outputs(mask: u8) -> Vec<CharacterOutput> {
+    let mut outputs = vec![CharacterOutput {
+        name: "Braille",
+        glyph: braille_glyph(mask),
+    }];
+
+    if let Some(mask) = top_aligned_mask(mask, 2) {
+        outputs.push(CharacterOutput {
+            name: "Quadrant",
+            glyph: QUADRANTS[usize::from(mask)],
+        });
+    }
+    if let Some(mask) = top_aligned_mask(mask, 3) {
+        outputs.push(CharacterOutput {
+            name: "Sextant",
+            glyph: SEXTANTS[usize::from(mask)],
+        });
+    }
+    outputs.push(CharacterOutput {
+        name: "Octant",
+        glyph: octant_glyph(mask),
+    });
+    outputs
+}
+
+fn exact_outputs_text(mask: u8) -> String {
+    exact_outputs(mask)
+        .into_iter()
+        .map(|output| {
+            format!(
+                "{:<8} {} U+{:04X}",
+                output.name, output.glyph, output.glyph as u32
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn scaled_outputs_text(cells: &[[bool; 2]; 4]) -> String {
+    let octant = octant_glyph(cells_mask(cells));
+    let sextant = SEXTANTS[usize::from(vertically_scaled_mask(cells, 3))];
+    let quadrant_mask = vertically_scaled_mask(cells, 2);
+    let quadrant = QUADRANTS[usize::from(quadrant_mask)];
+    let halfblock = halfblock_output(quadrant_mask);
+
+    format!(
+        "Octant    {octant} U+{:04X}\n\n\
+         Sextant   {sextant} U+{:04X}\n\n\
+         Quadrant  {quadrant} U+{:04X}\n\n\
+         Halfblock {halfblock}",
+        octant as u32, sextant as u32, quadrant as u32,
+    )
+}
+
+fn top_aligned_mask(mask: u8, height: usize) -> Option<u8> {
+    debug_assert!((1..=3).contains(&height));
+    (mask >> (height * 2) == 0).then_some(mask)
+}
+
+fn braille_glyph(mask: u8) -> char {
+    // Convert row-major 2x4 bits to Unicode's dot order: left dots 1, 2, 3, 7
+    // and right dots 4, 5, 6, 8.
+    const DOT_BITS: [u8; 8] = [0, 3, 1, 4, 2, 5, 6, 7];
+    let dots = DOT_BITS
+        .into_iter()
+        .enumerate()
+        .fold(0, |dots, (cell_bit, dot_bit)| {
+            dots | ((mask >> cell_bit & 1) << dot_bit)
+        });
+    char::from_u32(0x2800 + u32::from(dots)).expect("braille code point is valid")
 }
 
 struct MouseCapture;
@@ -440,6 +534,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scaling_is_opt_in() {
+        assert!(!Cli::try_parse_from(["tblocks-rs"]).unwrap().scaling);
+        assert!(
+            Cli::try_parse_from(["tblocks-rs", "--scaling"])
+                .unwrap()
+                .scaling
+        );
+    }
+
+    #[test]
     fn mask_uses_row_major_octant_numbering() {
         let mut app = App::default();
         app.cells[0][0] = true;
@@ -447,6 +551,94 @@ mod tests {
         app.cells[3][1] = true;
 
         assert_eq!(app.mask(), 0b1000_1001);
+    }
+
+    #[test]
+    fn braille_mapping_uses_unicode_dot_order() {
+        let examples = [
+            (0x01, '\u{2801}'),
+            (0x03, '\u{2809}'),
+            (0x07, '\u{280B}'),
+            (0x0F, '\u{281B}'),
+            (0x1F, '\u{281F}'),
+            (0x3F, '\u{283F}'),
+            (0x7F, '\u{287F}'),
+            (0xFF, '\u{28FF}'),
+            (0xDF, '\u{28DF}'),
+            (0x66, '\u{286A}'),
+            (0x90, '\u{2884}'),
+        ];
+
+        for (mask, expected) in examples {
+            assert_eq!(braille_glyph(mask), expected, "mask {mask:#04x}");
+        }
+    }
+
+    #[test]
+    fn exact_outputs_only_use_top_aligned_compatible_grids() {
+        assert_eq!(
+            exact_outputs(0x01),
+            vec![
+                CharacterOutput {
+                    name: "Braille",
+                    glyph: '\u{2801}',
+                },
+                CharacterOutput {
+                    name: "Quadrant",
+                    glyph: '\u{2598}',
+                },
+                CharacterOutput {
+                    name: "Sextant",
+                    glyph: '\u{1FB00}',
+                },
+                CharacterOutput {
+                    name: "Octant",
+                    glyph: '\u{1CEA8}',
+                },
+            ]
+        );
+
+        assert_eq!(
+            exact_outputs(0x1F)
+                .into_iter()
+                .map(|output| output.name)
+                .collect::<Vec<_>>(),
+            ["Braille", "Sextant", "Octant"]
+        );
+        assert_eq!(
+            exact_outputs(0x90)
+                .into_iter()
+                .map(|output| output.name)
+                .collect::<Vec<_>>(),
+            ["Braille", "Octant"]
+        );
+    }
+
+    #[test]
+    fn exact_outputs_match_representative_patterns() {
+        let examples = [
+            (0x01, "⠁▘🬀𜺨"),
+            (0x03, "⠉▀🬂🮂"),
+            (0x07, "⠋▛🬆𜴂"),
+            (0x0F, "⠛█🬎▀"),
+            (0x1F, "⠟🬝𜴗"),
+            (0x3F, "⠿█🮅"),
+            (0x7F, "⡿𜵰"),
+            (0xFF, "⣿█"),
+            (0xDF, "⣟𜷊"),
+            (0x66, "⡪𜵗"),
+            (0x90, "⢄𜶀"),
+            (0x20, "⠠🬞𜴘"),
+            (0x08, "⠐▗🬇𜴃"),
+        ];
+
+        for (mask, expected) in examples {
+            let actual = exact_outputs(mask)
+                .into_iter()
+                .map(|output| output.glyph)
+                .collect::<String>();
+            assert_eq!(actual, expected, "mask {mask:#04x}");
+        }
     }
 
     #[test]
