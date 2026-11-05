@@ -1,26 +1,32 @@
 use std::io::{self, stdout};
 
 use clap::Parser;
+use crossterm::{
+    clipboard::CopyToClipboard,
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    },
+    execute,
+};
 use ratatui::{
     Frame,
     buffer::Buffer,
-    crossterm::{
-        event::{
-            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-            KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-        },
-        execute,
-    },
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     symbols::pixel::{QUADRANTS, SEXTANTS},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Widget},
 };
 
 const GRID_WIDTH: u16 = 7;
 const GRID_HEIGHT: u16 = 9;
-const APP_WIDTH: u16 = 39;
+const APP_WIDTH: u16 = 41;
 const APP_HEIGHT: u16 = 13;
+const OUTPUT_CODEPOINT_COLUMN: usize = 10;
+const OUTPUT_GLYPH_COLUMN: usize = 19;
+const HOTKEY_COLOR: Color = Color::Indexed(11);
+const GLYPH_COLOR: Color = Color::Indexed(10);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Build Unicode terminal block characters")]
@@ -42,16 +48,10 @@ fn main() -> io::Result<()> {
 struct App {
     cells: [[bool; 2]; 4],
     scaling: bool,
-    last_cell_action: Option<CellAction>,
     grid_area: Option<Rect>,
     select_all_area: Option<Rect>,
+    select_none_area: Option<Rect>,
     should_quit: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CellAction {
-    Fill,
-    Clear,
 }
 
 impl App {
@@ -65,7 +65,12 @@ impl App {
     fn run(&mut self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
         while !self.should_quit {
             terminal.draw(|frame| self.render(frame))?;
-            self.handle_event(event::read()?);
+            if let Some(glyph) = self.handle_event(event::read()?) {
+                execute!(
+                    stdout(),
+                    CopyToClipboard::to_clipboard_from(glyph.to_string())
+                )?;
+            }
         }
         Ok(())
     }
@@ -74,6 +79,7 @@ impl App {
         let Some(layout) = AppLayout::new(frame.area()) else {
             self.grid_area = None;
             self.select_all_area = None;
+            self.select_none_area = None;
             frame.render_widget(
                 Paragraph::new(format!(
                     "Terminal too small (need {APP_WIDTH} x {APP_HEIGHT})"
@@ -85,61 +91,58 @@ impl App {
         };
         self.grid_area = Some(layout.grid);
         self.select_all_area = Some(layout.select_all);
+        self.select_none_area = Some(layout.select_none);
 
         frame.render_widget(
-            Paragraph::new("Octant builder")
+            Paragraph::new("Octant Builder")
                 .alignment(Alignment::Center)
-                .style(Style::default().add_modifier(Modifier::BOLD)),
+                .style(Style::default().fg(Color::Indexed(15))),
             layout.title,
         );
         frame.render_widget(CellGrid::new(&self.cells), layout.grid);
-        frame.render_widget(
-            Paragraph::new("All").style(Style::default().fg(Color::DarkGray)),
-            layout.select_all_label,
-        );
-        frame.render_widget(
-            Paragraph::new(self.select_all_text()).style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            layout.select_all,
-        );
-
-        let (output_title, output_text) = if self.scaling {
-            (" Scaled outputs ", scaled_outputs_text(&self.cells))
+        let output_text = if self.scaling {
+            scaled_outputs_text(&self.cells)
         } else {
-            (" Exact outputs ", exact_outputs_text(self.mask()))
+            exact_outputs_text(self.mask())
         };
-        let outputs = Paragraph::new(output_text)
-            .style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .block(Block::new().title(output_title).borders(Borders::ALL));
+        let outputs = Paragraph::new(output_text).block(Block::new().borders(Borders::ALL));
         frame.render_widget(outputs, layout.outputs);
 
-        frame.render_widget(
-            Paragraph::new("Click cells  •  q/Esc quits")
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::DarkGray)),
-            layout.help,
-        );
+        frame.render_widget(Paragraph::new(help_text()), layout.help);
     }
 
-    fn handle_event(&mut self, event: Event) {
+    fn handle_event(&mut self, event: Event) -> Option<char> {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 let ctrl_c =
                     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) || ctrl_c {
+                if key.code == KeyCode::Esc || ctrl_c {
                     self.should_quit = true;
+                } else if key.modifiers.is_empty()
+                    && let KeyCode::Char(hotkey) = key.code
+                {
+                    if matches!(hotkey, 'a' | 'n') {
+                        self.set_all(hotkey == 'a');
+                        return None;
+                    }
+                    if hotkey == 'b' {
+                        return Some(braille_glyph(self.mask()));
+                    }
+                    let outputs = if self.scaling {
+                        scaled_outputs(&self.cells)
+                    } else {
+                        exact_outputs(self.mask())
+                    };
+                    return outputs
+                        .into_iter()
+                        .find(|output| output.hotkey == hotkey)
+                        .map(|output| output.glyph);
                 }
             }
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             _ => {}
         }
+        None
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -151,7 +154,14 @@ impl App {
             .select_all_area
             .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
         {
-            self.toggle_all();
+            self.set_all(true);
+            return;
+        }
+        if self
+            .select_none_area
+            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+        {
+            self.set_all(false);
             return;
         }
 
@@ -167,42 +177,34 @@ impl App {
         cells_mask(&self.cells)
     }
 
-    fn select_all_text(&self) -> &'static str {
-        let mut cells = self.cells.iter().flatten();
-        let Some(first) = cells.next() else {
-            return "[   ]";
-        };
-        if cells.all(|cell| cell == first) {
-            if *first { "[ x ]" } else { "[   ]" }
-        } else {
-            "[ - ]"
-        }
-    }
-
-    fn toggle_all(&mut self) {
-        let all_filled = self.cells.iter().flatten().all(|cell| *cell);
-        let any_filled = self.cells.iter().flatten().any(|cell| *cell);
-        let fill = match (all_filled, any_filled, self.last_cell_action) {
-            (true, _, _) => false,
-            (false, false, _) => true,
-            (false, true, Some(CellAction::Clear)) => false,
-            (false, true, _) => true,
-        };
-        self.cells
-            .iter_mut()
-            .flatten()
-            .for_each(|cell| *cell = fill);
+    fn set_all(&mut self, filled: bool) {
+        self.cells.fill([filled; 2]);
     }
 
     fn toggle_cell(&mut self, row: usize, column: usize) {
         let cell = &mut self.cells[row][column];
         *cell = !*cell;
-        self.last_cell_action = Some(if *cell {
-            CellAction::Fill
-        } else {
-            CellAction::Clear
-        });
     }
+}
+
+fn help_text() -> Line<'static> {
+    let hotkey_style = Style::default().fg(HOTKEY_COLOR);
+    Line::from(vec![
+        Span::styled("b", hotkey_style),
+        Span::raw("/"),
+        Span::styled("q", hotkey_style),
+        Span::raw("/"),
+        Span::styled("s", hotkey_style),
+        Span::raw("/"),
+        Span::styled("c", hotkey_style),
+        Span::raw(" copy • select "),
+        Span::styled("a", hotkey_style),
+        Span::raw("ll/"),
+        Span::styled("n", hotkey_style),
+        Span::raw("one • "),
+        Span::styled("esc", hotkey_style),
+        Span::raw(" quit"),
+    ])
 }
 
 fn cells_mask(cells: &[[bool; 2]; 4]) -> u8 {
@@ -218,61 +220,109 @@ fn cells_mask(cells: &[[bool; 2]; 4]) -> u8 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CharacterOutput {
     name: &'static str,
+    hotkey: char,
     glyph: char,
 }
 
 fn exact_outputs(mask: u8) -> Vec<CharacterOutput> {
     let mut outputs = vec![CharacterOutput {
         name: "Braille",
+        hotkey: 'b',
         glyph: braille_glyph(mask),
     }];
 
     if let Some(mask) = top_aligned_mask(mask, 2) {
         outputs.push(CharacterOutput {
             name: "Quadrant",
+            hotkey: 'q',
             glyph: QUADRANTS[usize::from(mask)],
         });
     }
     if let Some(mask) = top_aligned_mask(mask, 3) {
         outputs.push(CharacterOutput {
             name: "Sextant",
+            hotkey: 's',
             glyph: SEXTANTS[usize::from(mask)],
         });
     }
     outputs.push(CharacterOutput {
         name: "Octant",
+        hotkey: 'c',
         glyph: octant_glyph(mask),
     });
     outputs
 }
 
-fn exact_outputs_text(mask: u8) -> String {
-    exact_outputs(mask)
-        .into_iter()
-        .map(|output| {
-            format!(
-                "{:<8} {} U+{:04X}",
-                output.name, output.glyph, output.glyph as u32
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
+fn exact_outputs_text(mask: u8) -> Text<'static> {
+    outputs_text(exact_outputs(mask))
 }
 
-fn scaled_outputs_text(cells: &[[bool; 2]; 4]) -> String {
-    let octant = octant_glyph(cells_mask(cells));
-    let sextant = SEXTANTS[usize::from(vertically_scaled_mask(cells, 3))];
-    let quadrant_mask = vertically_scaled_mask(cells, 2);
-    let quadrant = QUADRANTS[usize::from(quadrant_mask)];
-    let halfblock = halfblock_output(quadrant_mask);
+fn outputs_text(outputs: Vec<CharacterOutput>) -> Text<'static> {
+    let mut lines = Vec::new();
+    for output in outputs {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        let mut line = Line::from(
+            output
+                .name
+                .to_ascii_lowercase()
+                .chars()
+                .map(|letter| {
+                    let style = if letter.eq_ignore_ascii_case(&output.hotkey) {
+                        Style::default().fg(HOTKEY_COLOR)
+                    } else {
+                        Style::default()
+                    };
+                    Span::styled(letter.to_string(), style)
+                })
+                .collect::<Vec<_>>(),
+        );
+        line.spans.insert(0, Span::raw(" "));
+        line.push_span(" ".repeat(OUTPUT_CODEPOINT_COLUMN.saturating_sub(line.width())));
+        line.push_span(Span::styled(
+            format!("U+{:04X}", output.glyph as u32),
+            Style::default().fg(Color::Indexed(8)),
+        ));
+        line.push_span(" ".repeat(OUTPUT_GLYPH_COLUMN.saturating_sub(line.width())));
+        line.push_span(Span::styled(
+            output.glyph.to_string(),
+            Style::default().fg(GLYPH_COLOR),
+        ));
+        lines.push(line);
+    }
+    Text::from(lines)
+}
 
-    format!(
-        "Octant    {octant} U+{:04X}\n\n\
-         Sextant   {sextant} U+{:04X}\n\n\
-         Quadrant  {quadrant} U+{:04X}\n\n\
-         Halfblock {halfblock}",
-        octant as u32, sextant as u32, quadrant as u32,
-    )
+fn scaled_outputs(cells: &[[bool; 2]; 4]) -> Vec<CharacterOutput> {
+    vec![
+        CharacterOutput {
+            name: "Octant",
+            hotkey: 'c',
+            glyph: octant_glyph(cells_mask(cells)),
+        },
+        CharacterOutput {
+            name: "Sextant",
+            hotkey: 's',
+            glyph: SEXTANTS[usize::from(vertically_scaled_mask(cells, 3))],
+        },
+        CharacterOutput {
+            name: "Quadrant",
+            hotkey: 'q',
+            glyph: QUADRANTS[usize::from(vertically_scaled_mask(cells, 2))],
+        },
+    ]
+}
+
+fn scaled_outputs_text(cells: &[[bool; 2]; 4]) -> Text<'static> {
+    let mut outputs = outputs_text(scaled_outputs(cells));
+    let halfblock = halfblock_output(vertically_scaled_mask(cells, 2));
+    outputs.lines.push(Line::default());
+    let mut line = Line::from(" halfblock");
+    line.push_span(" ".repeat(OUTPUT_GLYPH_COLUMN.saturating_sub(line.width())));
+    line.push_span(Span::styled(halfblock, Style::default().fg(GLYPH_COLOR)));
+    outputs.lines.push(line);
+    outputs
 }
 
 fn top_aligned_mask(mask: u8, height: usize) -> Option<u8> {
@@ -312,8 +362,8 @@ impl Drop for MouseCapture {
 struct AppLayout {
     title: Rect,
     grid: Rect,
-    select_all_label: Rect,
     select_all: Rect,
+    select_none: Rect,
     outputs: Rect,
     help: Rect,
 }
@@ -326,12 +376,13 @@ impl AppLayout {
 
         let x = area.x + (area.width - APP_WIDTH) / 2;
         let y = area.y + (area.height - APP_HEIGHT) / 2;
+        let select_all_x = x + Line::from("b/q/s/c copy • select ").width() as u16;
         Some(Self {
             title: Rect::new(x, y, APP_WIDTH, 1),
-            grid: Rect::new(x + 2, y + 2, GRID_WIDTH, GRID_HEIGHT),
-            select_all_label: Rect::new(x + 1, y + 11, 3, 1),
-            select_all: Rect::new(x + 5, y + 11, 5, 1),
-            outputs: Rect::new(x + 12, y + 2, 25, 9),
+            grid: Rect::new(x + 3, y + 2, GRID_WIDTH, GRID_HEIGHT),
+            select_all: Rect::new(select_all_x, y + 12, 3, 1),
+            select_none: Rect::new(select_all_x + 4, y + 12, 4, 1),
+            outputs: Rect::new(x + 13, y + 2, 24, 9),
             help: Rect::new(x, y + 12, APP_WIDTH, 1),
         })
     }
@@ -581,18 +632,22 @@ mod tests {
             vec![
                 CharacterOutput {
                     name: "Braille",
+                    hotkey: 'b',
                     glyph: '\u{2801}',
                 },
                 CharacterOutput {
                     name: "Quadrant",
+                    hotkey: 'q',
                     glyph: '\u{2598}',
                 },
                 CharacterOutput {
                     name: "Sextant",
+                    hotkey: 's',
                     glyph: '\u{1FB00}',
                 },
                 CharacterOutput {
                     name: "Octant",
+                    hotkey: 'c',
                     glyph: '\u{1CEA8}',
                 },
             ]
@@ -670,42 +725,44 @@ mod tests {
     }
 
     #[test]
-    fn select_all_control_cycles_empty_and_full() {
+    fn selection_hotkeys_fill_and_clear_partial_grids() {
         let mut app = App::default();
-        assert_eq!(app.select_all_text(), "[   ]");
-
-        app.toggle_all();
-        assert!(app.cells.iter().flatten().all(|cell| *cell));
-        assert_eq!(app.select_all_text(), "[ x ]");
-
-        app.toggle_all();
-        assert!(app.cells.iter().flatten().all(|cell| !cell));
-        assert_eq!(app.select_all_text(), "[   ]");
+        for hotkey in ['a', 'a', 'n', 'n'] {
+            app.toggle_cell(2, 1);
+            assert_eq!(
+                app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char(hotkey),
+                    KeyModifiers::NONE,
+                ))),
+                None,
+            );
+            assert!(
+                app.cells
+                    .iter()
+                    .flatten()
+                    .all(|cell| *cell == (hotkey == 'a'))
+            );
+        }
     }
 
     #[test]
-    fn partial_select_all_control_repeats_last_fill() {
-        let mut app = App::default();
-        app.toggle_cell(2, 1);
-        assert_eq!(app.select_all_text(), "[ - ]");
-        assert_eq!(app.last_cell_action, Some(CellAction::Fill));
-
-        app.toggle_all();
-        assert!(app.cells.iter().flatten().all(|cell| *cell));
-        assert_eq!(app.select_all_text(), "[ x ]");
-    }
-
-    #[test]
-    fn partial_select_all_control_repeats_last_clear() {
-        let mut app = App::default();
-        app.toggle_all();
-        app.toggle_cell(2, 1);
-        assert_eq!(app.select_all_text(), "[ - ]");
-        assert_eq!(app.last_cell_action, Some(CellAction::Clear));
-
-        app.toggle_all();
-        assert!(app.cells.iter().flatten().all(|cell| !cell));
-        assert_eq!(app.select_all_text(), "[   ]");
+    fn footer_clicks_select_all_and_none() {
+        let layout = AppLayout::new(Rect::new(0, 0, APP_WIDTH, APP_HEIGHT)).unwrap();
+        let mut app = App {
+            select_all_area: Some(layout.select_all),
+            select_none_area: Some(layout.select_none),
+            ..App::default()
+        };
+        for (area, filled) in [(layout.select_all, true), (layout.select_none, false)] {
+            app.toggle_cell(2, 1);
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(app.cells.iter().flatten().all(|cell| *cell == filled));
+        }
     }
 
     #[test]
@@ -768,11 +825,12 @@ mod tests {
     fn layout_is_centered_and_rejects_small_terminals() {
         let layout = AppLayout::new(Rect::new(0, 0, 59, 23)).unwrap();
 
-        assert_eq!(layout.title, Rect::new(10, 5, APP_WIDTH, 1));
+        assert_eq!(layout.title, Rect::new(9, 5, APP_WIDTH, 1));
         assert_eq!(layout.grid, Rect::new(12, 7, GRID_WIDTH, GRID_HEIGHT));
-        assert_eq!(layout.select_all, Rect::new(15, 16, 5, 1));
-        assert_eq!(layout.outputs, Rect::new(22, 7, 25, 9));
-        assert!(AppLayout::new(Rect::new(0, 0, 38, 13)).is_none());
-        assert!(AppLayout::new(Rect::new(0, 0, 39, 12)).is_none());
+        assert_eq!(layout.select_all, Rect::new(31, 17, 3, 1));
+        assert_eq!(layout.select_none, Rect::new(35, 17, 4, 1));
+        assert_eq!(layout.outputs, Rect::new(22, 7, 24, 9));
+        assert!(AppLayout::new(Rect::new(0, 0, 40, 13)).is_none());
+        assert!(AppLayout::new(Rect::new(0, 0, 41, 12)).is_none());
     }
 }
