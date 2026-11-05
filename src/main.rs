@@ -4,8 +4,8 @@ use clap::Parser;
 use crossterm::{
     clipboard::CopyToClipboard,
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
 };
@@ -21,12 +21,14 @@ use ratatui::{
 
 const GRID_WIDTH: u16 = 7;
 const GRID_HEIGHT: u16 = 9;
-const APP_WIDTH: u16 = 41;
-const APP_HEIGHT: u16 = 13;
+const APP_WIDTH: u16 = 43;
+const APP_HEIGHT: u16 = 15;
 const OUTPUT_CODEPOINT_COLUMN: usize = 10;
 const OUTPUT_GLYPH_COLUMN: usize = 19;
 const HOTKEY_COLOR: Color = Color::Indexed(11);
 const GLYPH_COLOR: Color = Color::Indexed(10);
+// Unicode dot order for row-major 2x4 cells: left 1, 2, 3, 7; right 4, 5, 6, 8.
+const BRAILLE_DOT_BITS: [u8; 8] = [0, 3, 1, 4, 2, 5, 6, 7];
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Build Unicode terminal block characters")]
@@ -39,7 +41,7 @@ struct Cli {
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
     ratatui::run(|terminal| {
-        let _mouse_capture = MouseCapture::enable()?;
+        let _input_modes = InputModes::enable()?;
         App::new(cli.scaling).run(terminal)
     })
 }
@@ -48,6 +50,7 @@ fn main() -> io::Result<()> {
 struct App {
     cells: [[bool; 2]; 4],
     scaling: bool,
+    glyph_background: bool,
     grid_area: Option<Rect>,
     select_all_area: Option<Rect>,
     select_none_area: Option<Rect>,
@@ -58,6 +61,7 @@ impl App {
     fn new(scaling: bool) -> Self {
         Self {
             scaling,
+            glyph_background: true,
             ..Self::default()
         }
     }
@@ -100,15 +104,27 @@ impl App {
             layout.title,
         );
         frame.render_widget(CellGrid::new(&self.cells), layout.grid);
+        let mut glyph_style = Style::default().fg(GLYPH_COLOR);
+        if self.glyph_background {
+            glyph_style = glyph_style.bg(Color::Indexed(8));
+        }
         let output_text = if self.scaling {
-            scaled_outputs_text(&self.cells)
+            scaled_outputs_text(&self.cells, glyph_style)
         } else {
-            exact_outputs_text(self.mask())
+            exact_outputs_text(self.mask(), glyph_style)
         };
         let outputs = Paragraph::new(output_text).block(Block::new().borders(Borders::ALL));
         frame.render_widget(outputs, layout.outputs);
 
         frame.render_widget(Paragraph::new(help_text()), layout.help);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("esc", Style::default().fg(HOTKEY_COLOR)),
+                Span::raw(" quit"),
+            ]))
+            .alignment(Alignment::Center),
+            layout.quit,
+        );
     }
 
     fn handle_event(&mut self, event: Event) -> Option<char> {
@@ -121,6 +137,10 @@ impl App {
                 } else if key.modifiers.is_empty()
                     && let KeyCode::Char(hotkey) = key.code
                 {
+                    if hotkey == 'g' {
+                        self.glyph_background = !self.glyph_background;
+                        return None;
+                    }
                     if matches!(hotkey, 'a' | 'n') {
                         self.set_all(hotkey == 'a');
                         return None;
@@ -133,10 +153,19 @@ impl App {
                     } else {
                         exact_outputs(self.mask())
                     };
-                    return outputs
-                        .into_iter()
-                        .find(|output| output.hotkey == hotkey)
-                        .map(|output| output.glyph);
+                    if let Some(output) = outputs.into_iter().find(|output| output.hotkey == hotkey)
+                    {
+                        return Some(output.glyph);
+                    }
+                    self.load_glyph(hotkey);
+                }
+            }
+            Event::Paste(text) => {
+                let mut characters = text.trim_matches(['\r', '\n']).chars();
+                if let Some(glyph) = characters.next()
+                    && characters.next().is_none()
+                {
+                    self.load_glyph(glyph);
                 }
             }
             Event::Mouse(mouse) => self.handle_mouse(mouse),
@@ -177,6 +206,14 @@ impl App {
         cells_mask(&self.cells)
     }
 
+    fn load_glyph(&mut self, glyph: char) {
+        if let Some(mask) = glyph_mask(glyph) {
+            self.cells = std::array::from_fn(|row| {
+                std::array::from_fn(|column| mask & (1 << (row * 2 + column)) != 0)
+            });
+        }
+    }
+
     fn set_all(&mut self, filled: bool) {
         self.cells.fill([filled; 2]);
     }
@@ -201,9 +238,9 @@ fn help_text() -> Line<'static> {
         Span::styled("a", hotkey_style),
         Span::raw("ll/"),
         Span::styled("n", hotkey_style),
-        Span::raw("one • "),
-        Span::styled("esc", hotkey_style),
-        Span::raw(" quit"),
+        Span::raw("one • back"),
+        Span::styled("g", hotkey_style),
+        Span::raw("round"),
     ])
 }
 
@@ -253,11 +290,11 @@ fn exact_outputs(mask: u8) -> Vec<CharacterOutput> {
     outputs
 }
 
-fn exact_outputs_text(mask: u8) -> Text<'static> {
-    outputs_text(exact_outputs(mask))
+fn exact_outputs_text(mask: u8, glyph_style: Style) -> Text<'static> {
+    outputs_text(exact_outputs(mask), glyph_style)
 }
 
-fn outputs_text(outputs: Vec<CharacterOutput>) -> Text<'static> {
+fn outputs_text(outputs: Vec<CharacterOutput>, glyph_style: Style) -> Text<'static> {
     let mut lines = Vec::new();
     for output in outputs {
         if !lines.is_empty() {
@@ -285,10 +322,7 @@ fn outputs_text(outputs: Vec<CharacterOutput>) -> Text<'static> {
             Style::default().fg(Color::Indexed(8)),
         ));
         line.push_span(" ".repeat(OUTPUT_GLYPH_COLUMN.saturating_sub(line.width())));
-        line.push_span(Span::styled(
-            output.glyph.to_string(),
-            Style::default().fg(GLYPH_COLOR),
-        ));
+        line.push_span(Span::styled(output.glyph.to_string(), glyph_style));
         lines.push(line);
     }
     Text::from(lines)
@@ -314,13 +348,13 @@ fn scaled_outputs(cells: &[[bool; 2]; 4]) -> Vec<CharacterOutput> {
     ]
 }
 
-fn scaled_outputs_text(cells: &[[bool; 2]; 4]) -> Text<'static> {
-    let mut outputs = outputs_text(scaled_outputs(cells));
+fn scaled_outputs_text(cells: &[[bool; 2]; 4], glyph_style: Style) -> Text<'static> {
+    let mut outputs = outputs_text(scaled_outputs(cells), glyph_style);
     let halfblock = halfblock_output(vertically_scaled_mask(cells, 2));
     outputs.lines.push(Line::default());
     let mut line = Line::from(" halfblock");
     line.push_span(" ".repeat(OUTPUT_GLYPH_COLUMN.saturating_sub(line.width())));
-    line.push_span(Span::styled(halfblock, Style::default().fg(GLYPH_COLOR)));
+    line.push_span(Span::styled(halfblock, glyph_style));
     outputs.lines.push(line);
     outputs
 }
@@ -331,10 +365,7 @@ fn top_aligned_mask(mask: u8, height: usize) -> Option<u8> {
 }
 
 fn braille_glyph(mask: u8) -> char {
-    // Convert row-major 2x4 bits to Unicode's dot order: left dots 1, 2, 3, 7
-    // and right dots 4, 5, 6, 8.
-    const DOT_BITS: [u8; 8] = [0, 3, 1, 4, 2, 5, 6, 7];
-    let dots = DOT_BITS
+    let dots = BRAILLE_DOT_BITS
         .into_iter()
         .enumerate()
         .fold(0, |dots, (cell_bit, dot_bit)| {
@@ -343,18 +374,44 @@ fn braille_glyph(mask: u8) -> char {
     char::from_u32(0x2800 + u32::from(dots)).expect("braille code point is valid")
 }
 
-struct MouseCapture;
+fn glyph_mask(glyph: char) -> Option<u8> {
+    if ('\u{2800}'..='\u{28FF}').contains(&glyph) {
+        let dots = (glyph as u32 - 0x2800) as u8;
+        return Some(
+            BRAILLE_DOT_BITS
+                .into_iter()
+                .enumerate()
+                .fold(0, |mask, (cell_bit, dot_bit)| {
+                    mask | ((dots >> dot_bit & 1) << cell_bit)
+                }),
+        );
+    }
 
-impl MouseCapture {
+    // Shared block glyphs retain their full 2x4 octant shape.
+    (u8::MIN..=u8::MAX)
+        .find(|mask| octant_glyph(*mask) == glyph)
+        .or_else(|| {
+            QUADRANTS
+                .iter()
+                .position(|candidate| *candidate == glyph)
+                .or_else(|| SEXTANTS.iter().position(|candidate| *candidate == glyph))
+                .map(|mask| mask as u8)
+        })
+}
+
+struct InputModes;
+
+impl InputModes {
     fn enable() -> io::Result<Self> {
-        execute!(stdout(), EnableMouseCapture)?;
-        Ok(Self)
+        let modes = Self;
+        execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+        Ok(modes)
     }
 }
 
-impl Drop for MouseCapture {
+impl Drop for InputModes {
     fn drop(&mut self) {
-        let _ = execute!(stdout(), DisableMouseCapture);
+        let _ = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture);
     }
 }
 
@@ -366,6 +423,7 @@ struct AppLayout {
     select_none: Rect,
     outputs: Rect,
     help: Rect,
+    quit: Rect,
 }
 
 impl AppLayout {
@@ -379,11 +437,12 @@ impl AppLayout {
         let select_all_x = x + Line::from("b/q/s/c copy • select ").width() as u16;
         Some(Self {
             title: Rect::new(x, y, APP_WIDTH, 1),
-            grid: Rect::new(x + 3, y + 2, GRID_WIDTH, GRID_HEIGHT),
+            grid: Rect::new(x + 4, y + 2, GRID_WIDTH, GRID_HEIGHT),
             select_all: Rect::new(select_all_x, y + 12, 3, 1),
             select_none: Rect::new(select_all_x + 4, y + 12, 4, 1),
-            outputs: Rect::new(x + 13, y + 2, 24, 9),
+            outputs: Rect::new(x + 14, y + 2, 24, 9),
             help: Rect::new(x, y + 12, APP_WIDTH, 1),
+            quit: Rect::new(x, y + 14, APP_WIDTH, 1),
         })
     }
 }
@@ -626,6 +685,84 @@ mod tests {
     }
 
     #[test]
+    fn pasted_and_unbracketed_glyphs_replace_the_grid() {
+        for (glyph, expected) in [
+            ('\u{2884}', 0x90),
+            ('\u{2597}', 0xA0),
+            ('\u{1FB1E}', 0x20),
+            ('\u{1CD80}', 0x90),
+            ('\u{2598}', 0x05),
+            ('\u{2588}', 0xFF),
+            ('\u{2800}', 0x00),
+            (' ', 0x00),
+            ('\u{00A0}', 0x00),
+        ] {
+            for event in [
+                Event::Paste(glyph.to_string()),
+                Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char(glyph),
+                    KeyModifiers::NONE,
+                )),
+            ] {
+                let mut app = App::default();
+                app.set_all(true);
+
+                assert_eq!(app.handle_event(event), None);
+                assert_eq!(app.mask(), expected, "glyph {glyph:?}");
+                assert!(!app.should_quit);
+            }
+        }
+    }
+
+    #[test]
+    fn all_supported_glyphs_load_and_appear_in_exact_outputs() {
+        for mask in u8::MIN..=u8::MAX {
+            assert_eq!(glyph_mask(braille_glyph(mask)), Some(mask));
+            assert_eq!(glyph_mask(octant_glyph(mask)), Some(mask));
+        }
+
+        let glyphs = QUADRANTS
+            .into_iter()
+            .chain(SEXTANTS)
+            .chain((u8::MIN..=u8::MAX).map(octant_glyph));
+        for glyph in glyphs {
+            let mask = glyph_mask(glyph).expect("supported glyph decodes");
+            assert!(
+                exact_outputs(mask)
+                    .iter()
+                    .any(|output| output.glyph == glyph),
+                "glyph {glyph:?} was not reproduced after loading mask {mask:#04x}",
+            );
+        }
+    }
+
+    #[test]
+    fn paste_requires_one_supported_glyph_and_preserves_blank_characters() {
+        let mut app = App::default();
+        app.cells[3][1] = true;
+
+        for text in [
+            "",
+            "hello",
+            "n",
+            "q",
+            "c",
+            "\u{2801}\u{2802}",
+            " \u{2801}",
+            "\u{001B}",
+        ] {
+            assert_eq!(app.handle_event(Event::Paste(text.to_owned())), None);
+            assert_eq!(app.mask(), 0x80, "paste {text:?}");
+            assert!(!app.should_quit);
+        }
+
+        app.handle_event(Event::Paste("\r\n\u{2884}\n".to_owned()));
+        assert_eq!(app.mask(), 0x90);
+        app.handle_event(Event::Paste("\u{00A0}\n".to_owned()));
+        assert_eq!(app.mask(), 0x00);
+    }
+
+    #[test]
     fn exact_outputs_only_use_top_aligned_compatible_grids() {
         assert_eq!(
             exact_outputs(0x01),
@@ -825,12 +962,13 @@ mod tests {
     fn layout_is_centered_and_rejects_small_terminals() {
         let layout = AppLayout::new(Rect::new(0, 0, 59, 23)).unwrap();
 
-        assert_eq!(layout.title, Rect::new(9, 5, APP_WIDTH, 1));
-        assert_eq!(layout.grid, Rect::new(12, 7, GRID_WIDTH, GRID_HEIGHT));
-        assert_eq!(layout.select_all, Rect::new(31, 17, 3, 1));
-        assert_eq!(layout.select_none, Rect::new(35, 17, 4, 1));
-        assert_eq!(layout.outputs, Rect::new(22, 7, 24, 9));
-        assert!(AppLayout::new(Rect::new(0, 0, 40, 13)).is_none());
-        assert!(AppLayout::new(Rect::new(0, 0, 41, 12)).is_none());
+        assert_eq!(layout.title, Rect::new(8, 4, APP_WIDTH, 1));
+        assert_eq!(layout.grid, Rect::new(12, 6, GRID_WIDTH, GRID_HEIGHT));
+        assert_eq!(layout.select_all, Rect::new(30, 16, 3, 1));
+        assert_eq!(layout.select_none, Rect::new(34, 16, 4, 1));
+        assert_eq!(layout.outputs, Rect::new(22, 6, 24, 9));
+        assert_eq!(layout.quit, Rect::new(8, 18, APP_WIDTH, 1));
+        assert!(AppLayout::new(Rect::new(0, 0, 42, 15)).is_none());
+        assert!(AppLayout::new(Rect::new(0, 0, 43, 14)).is_none());
     }
 }
