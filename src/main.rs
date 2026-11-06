@@ -1,5 +1,7 @@
 use std::io::{self, stdout};
 
+mod sixteenths;
+
 use clap::Parser;
 use crossterm::{
     clipboard::CopyToClipboard,
@@ -30,10 +32,65 @@ const GLYPH_COLOR: Color = Color::Indexed(10);
 // Unicode dot order for row-major 2x4 cells: left 1, 2, 3, 7; right 4, 5, 6, 8.
 const BRAILLE_DOT_BITS: [u8; 8] = [0, 3, 1, 4, 2, 5, 6, 7];
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum GridMode {
+    #[default]
+    Octants,
+    Sixteenths,
+}
+
+impl GridMode {
+    fn other(self) -> Self {
+        match self {
+            Self::Octants => Self::Sixteenths,
+            Self::Sixteenths => Self::Octants,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Octants => "Octant Builder",
+            Self::Sixteenths => "Sixteenth Builder",
+        }
+    }
+
+    fn grid_label(self) -> &'static str {
+        match self {
+            Self::Octants => "2×4 grid",
+            Self::Sixteenths => "4×4 grid",
+        }
+    }
+
+    fn grid_width(self) -> u16 {
+        match self {
+            Self::Octants => GRID_WIDTH,
+            Self::Sixteenths => 13,
+        }
+    }
+
+    fn width(self) -> u16 {
+        APP_WIDTH + self.grid_width() - GRID_WIDTH
+    }
+
+    fn height(self) -> u16 {
+        match self {
+            Self::Octants => APP_HEIGHT,
+            Self::Sixteenths => APP_HEIGHT + 2,
+        }
+    }
+
+    fn copy_hotkeys(self) -> &'static str {
+        match self {
+            Self::Octants => "b/q/Q/s/S/c",
+            Self::Sixteenths => "b/q/Q/s/S/c/t",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(version, about = "Build Unicode terminal block characters")]
 struct Cli {
-    /// Scale the selected vertical bounds to each output character's height
+    /// Scale the selected vertical bounds to each output's height in 2x4 mode
     #[arg(long)]
     scaling: bool,
 }
@@ -49,6 +106,8 @@ fn main() -> io::Result<()> {
 #[derive(Default)]
 struct App {
     cells: [[bool; 2]; 4],
+    sixteenth_cells: [[bool; 4]; 4],
+    mode: GridMode,
     scaling: bool,
     glyph_background: bool,
     grid_area: Option<Rect>,
@@ -80,13 +139,15 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        let Some(layout) = AppLayout::new(frame.area()) else {
+        let Some(layout) = AppLayout::new(frame.area(), self.mode) else {
             self.grid_area = None;
             self.select_all_area = None;
             self.select_none_area = None;
             frame.render_widget(
                 Paragraph::new(format!(
-                    "Terminal too small (need {APP_WIDTH} x {APP_HEIGHT})"
+                    "Terminal too small (need {} x {})",
+                    self.mode.width(),
+                    self.mode.height(),
                 ))
                 .alignment(Alignment::Center),
                 frame.area(),
@@ -98,25 +159,53 @@ impl App {
         self.select_none_area = Some(layout.select_none);
 
         frame.render_widget(
-            Paragraph::new("Octant Builder")
+            Paragraph::new(self.mode.title())
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(Color::Indexed(15))),
             layout.title,
         );
-        frame.render_widget(CellGrid::new(&self.cells), layout.grid);
+        match self.mode {
+            GridMode::Octants => frame.render_widget(CellGrid::new(&self.cells), layout.grid),
+            GridMode::Sixteenths => {
+                frame.render_widget(CellGrid::new(&self.sixteenth_cells), layout.grid);
+            }
+        }
         let mut glyph_style = Style::default().fg(GLYPH_COLOR);
         if self.glyph_background {
             glyph_style = glyph_style.bg(Color::Indexed(8));
         }
-        let output_text = if self.scaling {
+        let output_text = if self.mode == GridMode::Sixteenths {
+            sixteenth_outputs_text(cells_mask(&self.sixteenth_cells), glyph_style)
+        } else if self.scaling {
             scaled_outputs_text(&self.cells, glyph_style)
         } else {
             exact_outputs_text(self.mask(), glyph_style)
         };
-        let outputs = Paragraph::new(output_text).block(Block::new().borders(Borders::ALL));
-        frame.render_widget(outputs, layout.outputs);
+        let block = Block::new().borders(Borders::ALL);
+        let mut output_area = block.inner(layout.outputs);
+        if self.mode == GridMode::Sixteenths {
+            let padding = output_area
+                .height
+                .saturating_sub(output_text.height() as u16)
+                / 2;
+            output_area.y += padding;
+            output_area.height -= padding;
+        }
+        frame.render_widget(block, layout.outputs);
+        frame.render_widget(Paragraph::new(output_text), output_area);
 
-        frame.render_widget(Paragraph::new(help_text()), layout.help);
+        frame.render_widget(
+            Paragraph::new(help_text(self.mode)).alignment(Alignment::Center),
+            layout.help,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("tab", Style::default().fg(HOTKEY_COLOR)),
+                Span::raw(format!(" {}", self.mode.other().grid_label())),
+            ]))
+            .alignment(Alignment::Center),
+            layout.switch,
+        );
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("esc", Style::default().fg(HOTKEY_COLOR)),
@@ -134,6 +223,8 @@ impl App {
                     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
                 if key.code == KeyCode::Esc || ctrl_c {
                     self.should_quit = true;
+                } else if key.code == KeyCode::Tab && key.modifiers.is_empty() {
+                    self.mode = self.mode.other();
                 } else if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
                     && let KeyCode::Char(hotkey) = key.code
                 {
@@ -145,10 +236,12 @@ impl App {
                         self.set_all(hotkey == 'a');
                         return None;
                     }
-                    if hotkey == 'b' {
+                    if self.mode == GridMode::Octants && hotkey == 'b' {
                         return Some(braille_glyph(self.mask()));
                     }
-                    let outputs = if self.scaling {
+                    let outputs = if self.mode == GridMode::Sixteenths {
+                        sixteenth_outputs(cells_mask(&self.sixteenth_cells))
+                    } else if self.scaling {
                         scaled_outputs(&self.cells)
                     } else {
                         exact_outputs(self.mask())
@@ -203,41 +296,55 @@ impl App {
     }
 
     fn mask(&self) -> u8 {
-        cells_mask(&self.cells)
+        cells_mask(&self.cells) as u8
     }
 
     fn load_glyph(&mut self, glyph: char) {
-        if let Some(mask) = glyph_mask(glyph) {
-            self.cells = std::array::from_fn(|row| {
-                std::array::from_fn(|column| mask & (1 << (row * 2 + column)) != 0)
-            });
+        match (self.mode, glyph_mask(glyph), sixteenths::mask(glyph)) {
+            // Shared glyphs keep the active grid; unique glyphs select their grid.
+            (GridMode::Sixteenths, _, Some(mask)) | (_, None, Some(mask)) => {
+                self.mode = GridMode::Sixteenths;
+                self.sixteenth_cells = cells_from_mask(mask);
+            }
+            (_, Some(mask), _) => {
+                self.mode = GridMode::Octants;
+                self.cells = cells_from_mask(u16::from(mask));
+            }
+            (_, None, None) => {}
         }
     }
 
     fn set_all(&mut self, filled: bool) {
-        self.cells.fill([filled; 2]);
+        match self.mode {
+            GridMode::Octants => self.cells.fill([filled; 2]),
+            GridMode::Sixteenths => self.sixteenth_cells.fill([filled; 4]),
+        }
     }
 
     fn toggle_cell(&mut self, row: usize, column: usize) {
-        let cell = &mut self.cells[row][column];
+        let cell = match self.mode {
+            GridMode::Octants => &mut self.cells[row][column],
+            GridMode::Sixteenths => &mut self.sixteenth_cells[row][column],
+        };
         *cell = !*cell;
     }
 }
 
-fn help_text() -> Line<'static> {
+fn help_text(mode: GridMode) -> Line<'static> {
     let hotkey_style = Style::default().fg(HOTKEY_COLOR);
-    Line::from(vec![
-        Span::styled("b", hotkey_style),
-        Span::raw("/"),
-        Span::styled("q", hotkey_style),
-        Span::raw("/"),
-        Span::styled("Q", hotkey_style),
-        Span::raw("/"),
-        Span::styled("s", hotkey_style),
-        Span::raw("/"),
-        Span::styled("S", hotkey_style),
-        Span::raw("/"),
-        Span::styled("c", hotkey_style),
+    let mut spans: Vec<_> = mode
+        .copy_hotkeys()
+        .chars()
+        .map(|letter| {
+            let style = if letter == '/' {
+                Style::default()
+            } else {
+                hotkey_style
+            };
+            Span::styled(letter.to_string(), style)
+        })
+        .collect();
+    spans.extend([
         Span::raw(" copy • select "),
         Span::styled("a", hotkey_style),
         Span::raw("ll/"),
@@ -245,17 +352,24 @@ fn help_text() -> Line<'static> {
         Span::raw("one • back"),
         Span::styled("g", hotkey_style),
         Span::raw("round"),
-    ])
+    ]);
+    Line::from(spans)
 }
 
-fn cells_mask(cells: &[[bool; 2]; 4]) -> u8 {
+fn cells_mask<const COLUMNS: usize>(cells: &[[bool; COLUMNS]; 4]) -> u16 {
     cells
         .iter()
         .flatten()
         .enumerate()
         .fold(0, |mask, (index, filled)| {
-            mask | (u8::from(*filled) << index)
+            mask | (u16::from(*filled) << index)
         })
+}
+
+fn cells_from_mask<const COLUMNS: usize>(mask: u16) -> [[bool; COLUMNS]; 4] {
+    std::array::from_fn(|row| {
+        std::array::from_fn(|column| mask & (1 << (row * COLUMNS + column)) != 0)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,31 +422,68 @@ fn exact_outputs_text(mask: u8, glyph_style: Style) -> Text<'static> {
     outputs_text(exact_outputs(mask), glyph_style)
 }
 
+fn sixteenth_outputs(mask: u16) -> Vec<CharacterOutput> {
+    let mut outputs = sixteenths::octant_mask(mask)
+        .map(exact_outputs)
+        .unwrap_or_default();
+    if let Some(glyph) = sixteenths::glyph(mask) {
+        outputs.push(CharacterOutput {
+            name: "Sixteenth",
+            hotkey: 't',
+            glyph,
+        });
+    }
+    outputs
+}
+
+fn sixteenth_outputs_text(mask: u16, glyph_style: Style) -> Text<'static> {
+    let outputs = sixteenth_outputs(mask);
+    if !outputs.is_empty() {
+        outputs_text(outputs, glyph_style)
+    } else {
+        Text::from(vec![
+            output_label("Sixteenth", 't'),
+            Line::default(),
+            Line::styled(
+                " No single Unicode glyph",
+                Style::default().fg(Color::Indexed(8)),
+            ),
+        ])
+    }
+}
+
+fn output_label(name: &str, hotkey: char) -> Line<'static> {
+    let label = if hotkey.is_ascii_uppercase() {
+        name.to_owned()
+    } else {
+        name.to_ascii_lowercase()
+    };
+    let mut highlighted = false;
+    let mut line = Line::from(
+        label
+            .chars()
+            .map(|letter| {
+                let style = if !highlighted && letter == hotkey {
+                    highlighted = true;
+                    Style::default().fg(HOTKEY_COLOR)
+                } else {
+                    Style::default()
+                };
+                Span::styled(letter.to_string(), style)
+            })
+            .collect::<Vec<_>>(),
+    );
+    line.spans.insert(0, Span::raw(" "));
+    line
+}
+
 fn outputs_text(outputs: Vec<CharacterOutput>, glyph_style: Style) -> Text<'static> {
     let mut lines = Vec::new();
     for output in outputs {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        let label = if output.hotkey.is_ascii_uppercase() {
-            output.name.to_owned()
-        } else {
-            output.name.to_ascii_lowercase()
-        };
-        let mut line = Line::from(
-            label
-                .chars()
-                .map(|letter| {
-                    let style = if letter == output.hotkey {
-                        Style::default().fg(HOTKEY_COLOR)
-                    } else {
-                        Style::default()
-                    };
-                    Span::styled(letter.to_string(), style)
-                })
-                .collect::<Vec<_>>(),
-        );
-        line.spans.insert(0, Span::raw(" "));
+        let mut line = output_label(output.name, output.hotkey);
         line.push_span(" ".repeat(OUTPUT_CODEPOINT_COLUMN.saturating_sub(line.width())));
         line.push_span(Span::styled(
             format!("U+{:04X}", output.glyph as u32),
@@ -350,7 +501,7 @@ fn scaled_outputs(cells: &[[bool; 2]; 4]) -> Vec<CharacterOutput> {
         CharacterOutput {
             name: "Octant",
             hotkey: 'c',
-            glyph: octant_glyph(cells_mask(cells)),
+            glyph: octant_glyph(cells_mask(cells) as u8),
         },
         CharacterOutput {
             name: "Sextant",
@@ -466,26 +617,43 @@ struct AppLayout {
     select_none: Rect,
     outputs: Rect,
     help: Rect,
+    switch: Rect,
     quit: Rect,
 }
 
 impl AppLayout {
-    fn new(area: Rect) -> Option<Self> {
-        if area.width < APP_WIDTH || area.height < APP_HEIGHT {
+    fn new(area: Rect, mode: GridMode) -> Option<Self> {
+        let width = mode.width();
+        let height = mode.height();
+        let outputs_height = height - 6;
+        if area.width < width || area.height < height {
             return None;
         }
 
-        let x = area.x + (area.width - APP_WIDTH) / 2;
-        let y = area.y + (area.height - APP_HEIGHT) / 2;
-        let select_all_x = x + Line::from("b/q/Q/s/S/c copy • select ").width() as u16;
+        let x = area.x + (area.width - width) / 2;
+        let y = area.y + (area.height - height) / 2;
+        let help_x = x + (width - help_text(mode).width() as u16) / 2;
+        let select_all_x =
+            help_x + Line::from(format!("{} copy • select ", mode.copy_hotkeys())).width() as u16;
         Some(Self {
-            title: Rect::new(x, y, APP_WIDTH, 1),
-            grid: Rect::new(x + 4, y + 4, GRID_WIDTH, GRID_HEIGHT),
-            select_all: Rect::new(select_all_x, y + 16, 3, 1),
-            select_none: Rect::new(select_all_x + 4, y + 16, 4, 1),
-            outputs: Rect::new(x + 14, y + 2, 28, 13),
-            help: Rect::new(x, y + 16, APP_WIDTH, 1),
-            quit: Rect::new(x, y + 18, APP_WIDTH, 1),
+            title: Rect::new(x, y, width, 1),
+            grid: Rect::new(
+                x + 4,
+                y + 2 + (outputs_height - GRID_HEIGHT) / 2,
+                mode.grid_width(),
+                GRID_HEIGHT,
+            ),
+            select_all: Rect::new(select_all_x, y + height - 3, 3, 1),
+            select_none: Rect::new(select_all_x + 4, y + height - 3, 4, 1),
+            outputs: Rect::new(
+                x + 14 + mode.grid_width() - GRID_WIDTH,
+                y + 2,
+                28,
+                outputs_height,
+            ),
+            help: Rect::new(x, y + height - 3, width, 1),
+            switch: Rect::new(x, y + height - 2, width, 1),
+            quit: Rect::new(x, y + height - 1, width, 1),
         })
     }
 }
@@ -494,34 +662,38 @@ fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
     x >= area.x && x < area.right() && y >= area.y && y < area.bottom()
 }
 
-struct CellGrid<'a> {
-    cells: &'a [[bool; 2]; 4],
+struct CellGrid<'a, const COLUMNS: usize> {
+    cells: &'a [[bool; COLUMNS]; 4],
 }
 
-impl<'a> CellGrid<'a> {
-    fn new(cells: &'a [[bool; 2]; 4]) -> Self {
+impl<'a, const COLUMNS: usize> CellGrid<'a, COLUMNS> {
+    fn new(cells: &'a [[bool; COLUMNS]; 4]) -> Self {
         Self { cells }
     }
 }
 
-impl Widget for CellGrid<'_> {
+impl<const COLUMNS: usize> Widget for CellGrid<'_, COLUMNS> {
     fn render(self, area: Rect, buffer: &mut Buffer) {
-        if area.width < GRID_WIDTH || area.height < GRID_HEIGHT {
+        if area.width < COLUMNS as u16 * 3 + 1 || area.height < GRID_HEIGHT {
             return;
         }
 
-        const BORDER_ROWS: [&str; 5] = ["┌──┬──┐", "├──┼──┤", "├──┼──┤", "├──┼──┤", "└──┴──┘"];
+        let top = format!("┌{}┐", ["──"; COLUMNS].join("┬"));
+        let middle = format!("├{}┤", ["──"; COLUMNS].join("┼"));
+        let bottom = format!("└{}┘", ["──"; COLUMNS].join("┴"));
+        let cell_row = format!("│{}│", ["  "; COLUMNS].join("│"));
+        let border_rows = [&top, &middle, &middle, &middle, &bottom];
         let border_style = Style::default().fg(Color::DarkGray);
         let filled_style = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
 
-        for (row, border) in BORDER_ROWS.iter().enumerate() {
-            buffer.set_string(area.x, area.y + row as u16 * 2, *border, border_style);
+        for (row, border) in border_rows.iter().enumerate() {
+            buffer.set_string(area.x, area.y + row as u16 * 2, border, border_style);
         }
         for (row, cells) in self.cells.iter().enumerate() {
             let y = area.y + 1 + row as u16 * 2;
-            buffer.set_string(area.x, y, "│  │  │", border_style);
+            buffer.set_string(area.x, y, &cell_row, border_style);
             for (column, filled) in cells.iter().enumerate() {
                 if *filled {
                     buffer.set_string(area.x + 1 + column as u16 * 3, y, "██", filled_style);
@@ -538,16 +710,11 @@ fn grid_cell_at(grid: Rect, x: u16, y: u16) -> Option<(usize, usize)> {
 
     let local_x = x - grid.x;
     let local_y = y - grid.y;
-    if local_y.is_multiple_of(2) {
+    if local_y.is_multiple_of(2) || local_x.is_multiple_of(3) {
         return None;
     }
 
-    let column = match local_x {
-        1..=2 => 0,
-        4..=5 => 1,
-        _ => return None,
-    };
-    Some(((local_y / 2) as usize, column))
+    Some(((local_y / 2) as usize, (local_x / 3) as usize))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -805,7 +972,6 @@ mod tests {
             "\u{1CC20}",
             "\u{1CC30}",
             "\u{1CE50}",
-            "\u{1CE90}",
         ] {
             assert_eq!(app.handle_event(Event::Paste(text.to_owned())), None);
             assert_eq!(app.mask(), 0x80, "paste {text:?}");
@@ -951,6 +1117,200 @@ mod tests {
     }
 
     #[test]
+    fn tab_preserves_each_grids_selection_and_sixteenths_copy_exactly() {
+        for scaling in [false, true] {
+            let mut app = App::new(scaling);
+            app.cells[1][1] = true;
+            let tab = Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+            ));
+            assert_eq!(app.handle_event(tab.clone()), None);
+            assert_eq!(app.mode, GridMode::Sixteenths);
+            app.toggle_cell(3, 0);
+            let copy = Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('t'),
+                KeyModifiers::NONE,
+            ));
+            assert_eq!(app.handle_event(copy.clone()), Some('\u{1CE9C}'));
+            app.toggle_cell(3, 1);
+            assert_eq!(app.handle_event(copy.clone()), Some('\u{1CEA3}'));
+
+            app.handle_event(tab.clone());
+            assert_eq!(app.mode, GridMode::Octants);
+            assert_eq!(app.mask(), 0x08);
+            app.handle_event(tab);
+            assert_eq!(app.mode, GridMode::Sixteenths);
+            assert_eq!(cells_mask(&app.sixteenth_cells), 0x3000);
+
+            app.set_all(true);
+            assert_eq!(app.handle_event(copy.clone()), Some('█'));
+            app.set_all(false);
+            assert_eq!(app.handle_event(copy.clone()), Some('\u{00A0}'));
+            app.toggle_cell(0, 0);
+            app.toggle_cell(3, 0);
+            assert_eq!(app.handle_event(copy), None);
+            assert!(
+                sixteenth_outputs_text(cells_mask(&app.sixteenth_cells), Style::default())
+                    .to_string()
+                    .contains("No single Unicode glyph")
+            );
+            assert_eq!(app.mask(), 0x08);
+            assert!(!app.should_quit);
+        }
+    }
+
+    #[test]
+    fn four_by_four_pairs_show_matching_categories_at_their_original_rows() {
+        for (mask, braille, quadrant, sextant, separated_sextant) in [
+            (0x0003, '⠁', Some('▘'), '\u{1FB00}', '\u{1CE51}'),
+            (0x0030, '⠂', Some('▖'), '\u{1FB03}', '\u{1CE54}'),
+            (0x00F0, '⠒', Some('▄'), '\u{1FB0B}', '\u{1CE5C}'),
+            (0x0300, '⠄', None, '\u{1FB0F}', '\u{1CE60}'),
+        ] {
+            let outputs = sixteenth_outputs(mask);
+            let glyph = |hotkey| {
+                outputs
+                    .iter()
+                    .find(|output| output.hotkey == hotkey)
+                    .map(|output| output.glyph)
+            };
+            assert_eq!(glyph('b'), Some(braille));
+            assert_eq!(glyph('q'), quadrant);
+            assert_eq!(glyph('s'), Some(sextant), "mask {mask:#06x}");
+            assert_eq!(glyph('S'), Some(separated_sextant));
+            assert_eq!(glyph('t'), sixteenths::glyph(mask));
+            assert!(glyph('c').is_some());
+        }
+
+        for (mask, hotkeys) in [
+            (0x0003, "bqQsSct"),
+            (0x0300, "bsSct"),
+            (0x3000, "bct"),
+            (0x1000, "t"),
+            (0x1001, ""),
+        ] {
+            assert_eq!(
+                sixteenth_outputs(mask)
+                    .into_iter()
+                    .map(|output| output.hotkey)
+                    .collect::<String>(),
+                hotkeys,
+                "mask {mask:#06x}",
+            );
+        }
+    }
+
+    #[test]
+    fn four_by_four_copy_hotkeys_copy_the_visible_matching_categories() {
+        for scaling in [false, true] {
+            let mut app = App {
+                cells: [[true; 2]; 4],
+                sixteenth_cells: cells_from_mask(0x00F0),
+                mode: GridMode::Sixteenths,
+                ..App::new(scaling)
+            };
+            for (hotkey, expected) in [
+                ('b', '⠒'),
+                ('q', '▄'),
+                ('Q', '\u{1CC2C}'),
+                ('s', '\u{1FB0B}'),
+                ('S', '\u{1CE5C}'),
+                ('c', '\u{1CD06}'),
+                ('t', '\u{1CD06}'),
+            ] {
+                assert_eq!(
+                    app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                        KeyCode::Char(hotkey),
+                        if hotkey.is_ascii_uppercase() {
+                            KeyModifiers::SHIFT
+                        } else {
+                            KeyModifiers::NONE
+                        },
+                    ))),
+                    Some(expected),
+                    "hotkey {hotkey}, scaling {scaling}",
+                );
+            }
+
+            app.sixteenth_cells = cells_from_mask(0x1000);
+            for hotkey in ['b', 'q', 'Q', 's', 'S', 'c'] {
+                assert_eq!(
+                    app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                        KeyCode::Char(hotkey),
+                        KeyModifiers::NONE,
+                    ))),
+                    None,
+                );
+            }
+            assert_eq!(cells_mask(&app.sixteenth_cells), 0x1000);
+            assert_eq!(app.mask(), 0xFF);
+        }
+    }
+
+    #[test]
+    fn sixteenth_paste_selects_the_grid_and_shared_glyphs_keep_the_active_grid() {
+        let mut app = App::new(false);
+        for event in [
+            Event::Paste("\u{1CE9C}".to_owned()),
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('\u{1CE9C}'),
+                KeyModifiers::NONE,
+            )),
+        ] {
+            app.mode = GridMode::Octants;
+            app.handle_event(event);
+            assert_eq!(app.mode, GridMode::Sixteenths);
+            assert_eq!(cells_mask(&app.sixteenth_cells), 0x1000);
+        }
+
+        app.handle_event(Event::Paste("\u{1CEA3}".to_owned()));
+        assert_eq!(app.mode, GridMode::Sixteenths);
+        assert_eq!(cells_mask(&app.sixteenth_cells), 0x3000);
+        app.handle_event(Event::Paste("▗".to_owned()));
+        assert_eq!(app.mode, GridMode::Sixteenths);
+        assert_eq!(cells_mask(&app.sixteenth_cells), 0xCC00);
+        app.handle_event(Event::Paste("\u{2810}".to_owned()));
+        assert_eq!(app.mode, GridMode::Octants);
+        assert_eq!(app.mask(), 0x08);
+        app.handle_event(Event::Paste("\u{1CEA3}".to_owned()));
+        assert_eq!(app.mode, GridMode::Octants);
+        assert_eq!(app.mask(), 0x40);
+        assert_eq!(cells_mask(&app.sixteenth_cells), 0xCC00);
+    }
+
+    #[test]
+    fn four_column_grid_hit_testing_and_rendering_include_every_cell() {
+        let grid = Rect::new(10, 20, 13, GRID_HEIGHT);
+        for row in 0..4 {
+            for column in 0..4 {
+                for offset in [1, 2] {
+                    assert_eq!(
+                        grid_cell_at(grid, 10 + column * 3 + offset, 21 + row * 2),
+                        Some((row as usize, column as usize)),
+                    );
+                }
+            }
+        }
+        for y in grid.y..grid.bottom() {
+            for x in grid.x..grid.right() {
+                if (x - grid.x).is_multiple_of(3) || (y - grid.y).is_multiple_of(2) {
+                    assert_eq!(grid_cell_at(grid, x, y), None);
+                }
+            }
+        }
+
+        let cells = cells_from_mask::<4>(0x9000);
+        let mut buffer = Buffer::empty(grid);
+        CellGrid::new(&cells).render(grid, &mut buffer);
+        for x in [11, 12, 20, 21] {
+            assert_eq!(buffer[(x, 27)].symbol(), "█");
+        }
+        assert_eq!(buffer[(19, 27)].symbol(), "│");
+        assert_eq!(buffer[(22, 27)].symbol(), "│");
+    }
+
+    #[test]
     fn hit_testing_accepts_only_cell_interiors() {
         let grid = Rect::new(10, 20, GRID_WIDTH, GRID_HEIGHT);
 
@@ -1001,7 +1361,8 @@ mod tests {
 
     #[test]
     fn footer_clicks_select_all_and_none() {
-        let layout = AppLayout::new(Rect::new(0, 0, APP_WIDTH, APP_HEIGHT)).unwrap();
+        let layout =
+            AppLayout::new(Rect::new(0, 0, APP_WIDTH, APP_HEIGHT), GridMode::Octants).unwrap();
         let mut app = App {
             select_all_area: Some(layout.select_all),
             select_none_area: Some(layout.select_none),
@@ -1077,15 +1438,30 @@ mod tests {
 
     #[test]
     fn layout_is_centered_and_rejects_small_terminals() {
-        let layout = AppLayout::new(Rect::new(0, 0, 59, 23)).unwrap();
+        let layout = AppLayout::new(Rect::new(0, 0, 59, 23), GridMode::Octants).unwrap();
 
         assert_eq!(layout.title, Rect::new(6, 2, APP_WIDTH, 1));
         assert_eq!(layout.grid, Rect::new(10, 6, GRID_WIDTH, GRID_HEIGHT));
         assert_eq!(layout.select_all, Rect::new(32, 18, 3, 1));
         assert_eq!(layout.select_none, Rect::new(36, 18, 4, 1));
         assert_eq!(layout.outputs, Rect::new(20, 4, 28, 13));
+        assert_eq!(layout.switch, Rect::new(6, 19, APP_WIDTH, 1));
         assert_eq!(layout.quit, Rect::new(6, 20, APP_WIDTH, 1));
-        assert!(AppLayout::new(Rect::new(0, 0, APP_WIDTH - 1, APP_HEIGHT)).is_none());
-        assert!(AppLayout::new(Rect::new(0, 0, APP_WIDTH, APP_HEIGHT - 1)).is_none());
+        for mode in [GridMode::Octants, GridMode::Sixteenths] {
+            assert!(
+                AppLayout::new(Rect::new(0, 0, mode.width() - 1, mode.height()), mode).is_none()
+            );
+            assert!(
+                AppLayout::new(Rect::new(0, 0, mode.width(), mode.height() - 1), mode).is_none()
+            );
+            assert!(AppLayout::new(Rect::new(0, 0, mode.width(), mode.height()), mode).is_some());
+        }
+        let layout = AppLayout::new(Rect::new(0, 0, 59, 23), GridMode::Sixteenths).unwrap();
+        assert_eq!(layout.title, Rect::new(3, 1, 53, 1));
+        assert_eq!(layout.grid, Rect::new(7, 6, 13, 9));
+        assert_eq!(layout.outputs, Rect::new(23, 3, 28, 15));
+        assert_eq!(layout.help, Rect::new(3, 19, 53, 1));
+        assert_eq!(layout.switch, Rect::new(3, 20, 53, 1));
+        assert_eq!(layout.quit, Rect::new(3, 21, 53, 1));
     }
 }
