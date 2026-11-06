@@ -21,10 +21,10 @@ use ratatui::{
 
 const GRID_WIDTH: u16 = 7;
 const GRID_HEIGHT: u16 = 9;
-const APP_WIDTH: u16 = 43;
-const APP_HEIGHT: u16 = 15;
-const OUTPUT_CODEPOINT_COLUMN: usize = 10;
-const OUTPUT_GLYPH_COLUMN: usize = 19;
+const APP_WIDTH: u16 = 47;
+const APP_HEIGHT: u16 = 19;
+const OUTPUT_CODEPOINT_COLUMN: usize = 14;
+const OUTPUT_GLYPH_COLUMN: usize = 23;
 const HOTKEY_COLOR: Color = Color::Indexed(11);
 const GLYPH_COLOR: Color = Color::Indexed(10);
 // Unicode dot order for row-major 2x4 cells: left 1, 2, 3, 7; right 4, 5, 6, 8.
@@ -134,7 +134,7 @@ impl App {
                     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
                 if key.code == KeyCode::Esc || ctrl_c {
                     self.should_quit = true;
-                } else if key.modifiers.is_empty()
+                } else if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
                     && let KeyCode::Char(hotkey) = key.code
                 {
                     if hotkey == 'g' {
@@ -231,7 +231,11 @@ fn help_text() -> Line<'static> {
         Span::raw("/"),
         Span::styled("q", hotkey_style),
         Span::raw("/"),
+        Span::styled("Q", hotkey_style),
+        Span::raw("/"),
         Span::styled("s", hotkey_style),
+        Span::raw("/"),
+        Span::styled("S", hotkey_style),
         Span::raw("/"),
         Span::styled("c", hotkey_style),
         Span::raw(" copy • select "),
@@ -274,12 +278,22 @@ fn exact_outputs(mask: u8) -> Vec<CharacterOutput> {
             hotkey: 'q',
             glyph: QUADRANTS[usize::from(mask)],
         });
+        outputs.push(CharacterOutput {
+            name: "Quadrant sep",
+            hotkey: 'Q',
+            glyph: separated_mosaic_glyph(mask, 0x1CC20),
+        });
     }
     if let Some(mask) = top_aligned_mask(mask, 3) {
         outputs.push(CharacterOutput {
             name: "Sextant",
             hotkey: 's',
             glyph: SEXTANTS[usize::from(mask)],
+        });
+        outputs.push(CharacterOutput {
+            name: "Sextant sep",
+            hotkey: 'S',
+            glyph: separated_mosaic_glyph(mask, 0x1CE50),
         });
     }
     outputs.push(CharacterOutput {
@@ -300,13 +314,16 @@ fn outputs_text(outputs: Vec<CharacterOutput>, glyph_style: Style) -> Text<'stat
         if !lines.is_empty() {
             lines.push(Line::default());
         }
+        let label = if output.hotkey.is_ascii_uppercase() {
+            output.name.to_owned()
+        } else {
+            output.name.to_ascii_lowercase()
+        };
         let mut line = Line::from(
-            output
-                .name
-                .to_ascii_lowercase()
+            label
                 .chars()
                 .map(|letter| {
-                    let style = if letter.eq_ignore_ascii_case(&output.hotkey) {
+                    let style = if letter == output.hotkey {
                         Style::default().fg(HOTKEY_COLOR)
                     } else {
                         Style::default()
@@ -341,9 +358,19 @@ fn scaled_outputs(cells: &[[bool; 2]; 4]) -> Vec<CharacterOutput> {
             glyph: SEXTANTS[usize::from(vertically_scaled_mask(cells, 3))],
         },
         CharacterOutput {
+            name: "Sextant sep",
+            hotkey: 'S',
+            glyph: separated_mosaic_glyph(vertically_scaled_mask(cells, 3), 0x1CE50),
+        },
+        CharacterOutput {
             name: "Quadrant",
             hotkey: 'q',
             glyph: QUADRANTS[usize::from(vertically_scaled_mask(cells, 2))],
+        },
+        CharacterOutput {
+            name: "Quadrant sep",
+            hotkey: 'Q',
+            glyph: separated_mosaic_glyph(vertically_scaled_mask(cells, 2), 0x1CC20),
         },
     ]
 }
@@ -374,7 +401,23 @@ fn braille_glyph(mask: u8) -> char {
     char::from_u32(0x2800 + u32::from(dots)).expect("braille code point is valid")
 }
 
+fn separated_mosaic_glyph(mask: u8, base: u32) -> char {
+    // Nonempty separated quadrants and sextants follow row-major binary order.
+    // The preceding code point belongs to another set, so reuse space for zero.
+    if mask == 0 {
+        ' '
+    } else {
+        char::from_u32(base + u32::from(mask)).expect("separated mosaic code point is valid")
+    }
+}
+
 fn glyph_mask(glyph: char) -> Option<u8> {
+    match glyph {
+        '\u{1CC21}'..='\u{1CC2F}' => return Some((glyph as u32 - 0x1CC20) as u8),
+        '\u{1CE51}'..='\u{1CE8F}' => return Some((glyph as u32 - 0x1CE50) as u8),
+        _ => {}
+    }
+
     if ('\u{2800}'..='\u{28FF}').contains(&glyph) {
         let dots = (glyph as u32 - 0x2800) as u8;
         return Some(
@@ -434,15 +477,15 @@ impl AppLayout {
 
         let x = area.x + (area.width - APP_WIDTH) / 2;
         let y = area.y + (area.height - APP_HEIGHT) / 2;
-        let select_all_x = x + Line::from("b/q/s/c copy • select ").width() as u16;
+        let select_all_x = x + Line::from("b/q/Q/s/S/c copy • select ").width() as u16;
         Some(Self {
             title: Rect::new(x, y, APP_WIDTH, 1),
-            grid: Rect::new(x + 4, y + 2, GRID_WIDTH, GRID_HEIGHT),
-            select_all: Rect::new(select_all_x, y + 12, 3, 1),
-            select_none: Rect::new(select_all_x + 4, y + 12, 4, 1),
-            outputs: Rect::new(x + 14, y + 2, 24, 9),
-            help: Rect::new(x, y + 12, APP_WIDTH, 1),
-            quit: Rect::new(x, y + 14, APP_WIDTH, 1),
+            grid: Rect::new(x + 4, y + 4, GRID_WIDTH, GRID_HEIGHT),
+            select_all: Rect::new(select_all_x, y + 16, 3, 1),
+            select_none: Rect::new(select_all_x + 4, y + 16, 4, 1),
+            outputs: Rect::new(x + 14, y + 2, 28, 13),
+            help: Rect::new(x, y + 16, APP_WIDTH, 1),
+            quit: Rect::new(x, y + 18, APP_WIDTH, 1),
         })
     }
 }
@@ -693,6 +736,13 @@ mod tests {
             ('\u{1CD80}', 0x90),
             ('\u{2598}', 0x05),
             ('\u{2588}', 0xFF),
+            ('\u{1CC21}', 0x01),
+            ('\u{1CC28}', 0x08),
+            ('\u{1CC2F}', 0x0F),
+            ('\u{1CE51}', 0x01),
+            ('\u{1CE65}', 0x15),
+            ('\u{1CE7A}', 0x2A),
+            ('\u{1CE8F}', 0x3F),
             ('\u{2800}', 0x00),
             (' ', 0x00),
             ('\u{00A0}', 0x00),
@@ -724,7 +774,9 @@ mod tests {
         let glyphs = QUADRANTS
             .into_iter()
             .chain(SEXTANTS)
-            .chain((u8::MIN..=u8::MAX).map(octant_glyph));
+            .chain((u8::MIN..=u8::MAX).map(octant_glyph))
+            .chain('\u{1CC21}'..='\u{1CC2F}')
+            .chain('\u{1CE51}'..='\u{1CE8F}');
         for glyph in glyphs {
             let mask = glyph_mask(glyph).expect("supported glyph decodes");
             assert!(
@@ -750,6 +802,10 @@ mod tests {
             "\u{2801}\u{2802}",
             " \u{2801}",
             "\u{001B}",
+            "\u{1CC20}",
+            "\u{1CC30}",
+            "\u{1CE50}",
+            "\u{1CE90}",
         ] {
             assert_eq!(app.handle_event(Event::Paste(text.to_owned())), None);
             assert_eq!(app.mask(), 0x80, "paste {text:?}");
@@ -778,9 +834,19 @@ mod tests {
                     glyph: '\u{2598}',
                 },
                 CharacterOutput {
+                    name: "Quadrant sep",
+                    hotkey: 'Q',
+                    glyph: '\u{1CC21}',
+                },
+                CharacterOutput {
                     name: "Sextant",
                     hotkey: 's',
                     glyph: '\u{1FB00}',
+                },
+                CharacterOutput {
+                    name: "Sextant sep",
+                    hotkey: 'S',
+                    glyph: '\u{1CE51}',
                 },
                 CharacterOutput {
                     name: "Octant",
@@ -795,7 +861,7 @@ mod tests {
                 .into_iter()
                 .map(|output| output.name)
                 .collect::<Vec<_>>(),
-            ["Braille", "Sextant", "Octant"]
+            ["Braille", "Sextant", "Sextant sep", "Octant"]
         );
         assert_eq!(
             exact_outputs(0x90)
@@ -809,19 +875,20 @@ mod tests {
     #[test]
     fn exact_outputs_match_representative_patterns() {
         let examples = [
-            (0x01, "⠁▘🬀𜺨"),
-            (0x03, "⠉▀🬂🮂"),
-            (0x07, "⠋▛🬆𜴂"),
-            (0x0F, "⠛█🬎▀"),
-            (0x1F, "⠟🬝𜴗"),
-            (0x3F, "⠿█🮅"),
+            (0x00, "\u{2800}    \u{00A0}"),
+            (0x01, "⠁▘𜰡🬀𜹑𜺨"),
+            (0x03, "⠉▀𜰣🬂𜹓🮂"),
+            (0x07, "⠋▛𜰧🬆𜹗𜴂"),
+            (0x0F, "⠛█𜰯🬎𜹟▀"),
+            (0x1F, "⠟🬝𜹯𜴗"),
+            (0x3F, "⠿█𜺏🮅"),
             (0x7F, "⡿𜵰"),
             (0xFF, "⣿█"),
             (0xDF, "⣟𜷊"),
             (0x66, "⡪𜵗"),
             (0x90, "⢄𜶀"),
-            (0x20, "⠠🬞𜴘"),
-            (0x08, "⠐▗🬇𜴃"),
+            (0x20, "⠠🬞𜹰𜴘"),
+            (0x08, "⠐▗𜰨🬇𜹘𜴃"),
         ];
 
         for (mask, expected) in examples {
@@ -830,6 +897,56 @@ mod tests {
                 .map(|output| output.glyph)
                 .collect::<String>();
             assert_eq!(actual, expected, "mask {mask:#04x}");
+        }
+    }
+
+    #[test]
+    fn copy_hotkeys_select_ordinary_and_separated_outputs() {
+        for (scaling, quadrant, sextant, separated_quadrant, separated_sextant) in [
+            (false, '▗', '\u{1FB07}', '\u{1CC28}', '\u{1CE58}'),
+            (true, '▐', '▐', '\u{1CC2A}', '\u{1CE7A}'),
+        ] {
+            let mut app = App::new(scaling);
+            app.cells[1][1] = true;
+            for (hotkey, expected) in [
+                ('b', '\u{2810}'),
+                ('q', quadrant),
+                ('Q', separated_quadrant),
+                ('s', sextant),
+                ('S', separated_sextant),
+                ('c', '\u{1CD03}'),
+            ] {
+                let modifiers = if hotkey.is_ascii_uppercase() {
+                    vec![KeyModifiers::NONE, KeyModifiers::SHIFT]
+                } else {
+                    vec![KeyModifiers::NONE]
+                };
+                for modifiers in modifiers {
+                    assert_eq!(
+                        app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                            KeyCode::Char(hotkey),
+                            modifiers,
+                        ))),
+                        Some(expected),
+                        "scaling {scaling}, hotkey {hotkey}, modifiers {modifiers:?}",
+                    );
+                    assert_eq!(app.mask(), 0x08);
+                    assert!(!app.should_quit);
+                }
+            }
+        }
+
+        let mut app = App::new(false);
+        app.cells[3][0] = true;
+        for hotkey in ['q', 'Q', 's', 'S'] {
+            assert_eq!(
+                app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char(hotkey),
+                    KeyModifiers::NONE,
+                ))),
+                None,
+            );
+            assert_eq!(app.mask(), 0x40);
         }
     }
 
@@ -962,13 +1079,13 @@ mod tests {
     fn layout_is_centered_and_rejects_small_terminals() {
         let layout = AppLayout::new(Rect::new(0, 0, 59, 23)).unwrap();
 
-        assert_eq!(layout.title, Rect::new(8, 4, APP_WIDTH, 1));
-        assert_eq!(layout.grid, Rect::new(12, 6, GRID_WIDTH, GRID_HEIGHT));
-        assert_eq!(layout.select_all, Rect::new(30, 16, 3, 1));
-        assert_eq!(layout.select_none, Rect::new(34, 16, 4, 1));
-        assert_eq!(layout.outputs, Rect::new(22, 6, 24, 9));
-        assert_eq!(layout.quit, Rect::new(8, 18, APP_WIDTH, 1));
-        assert!(AppLayout::new(Rect::new(0, 0, 42, 15)).is_none());
-        assert!(AppLayout::new(Rect::new(0, 0, 43, 14)).is_none());
+        assert_eq!(layout.title, Rect::new(6, 2, APP_WIDTH, 1));
+        assert_eq!(layout.grid, Rect::new(10, 6, GRID_WIDTH, GRID_HEIGHT));
+        assert_eq!(layout.select_all, Rect::new(32, 18, 3, 1));
+        assert_eq!(layout.select_none, Rect::new(36, 18, 4, 1));
+        assert_eq!(layout.outputs, Rect::new(20, 4, 28, 13));
+        assert_eq!(layout.quit, Rect::new(6, 20, APP_WIDTH, 1));
+        assert!(AppLayout::new(Rect::new(0, 0, APP_WIDTH - 1, APP_HEIGHT)).is_none());
+        assert!(AppLayout::new(Rect::new(0, 0, APP_WIDTH, APP_HEIGHT - 1)).is_none());
     }
 }
