@@ -1,5 +1,6 @@
 use std::io::{self, stdout};
 
+mod eighths;
 mod sixteenths;
 
 use clap::Parser;
@@ -23,8 +24,7 @@ use ratatui::{
 
 const GRID_WIDTH: u16 = 7;
 const GRID_HEIGHT: u16 = 9;
-const APP_WIDTH: u16 = 47;
-const APP_HEIGHT: u16 = 19;
+const GRID_OUTPUT_GAP: u16 = 3;
 const OUTPUT_CODEPOINT_COLUMN: usize = 14;
 const OUTPUT_GLYPH_COLUMN: usize = 23;
 const HOTKEY_COLOR: Color = Color::Indexed(11);
@@ -37,20 +37,15 @@ enum GridMode {
     #[default]
     Octants,
     Sixteenths,
+    Eighths,
 }
 
 impl GridMode {
-    fn other(self) -> Self {
+    fn next(self) -> Self {
         match self {
             Self::Octants => Self::Sixteenths,
-            Self::Sixteenths => Self::Octants,
-        }
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::Octants => "Octant Builder",
-            Self::Sixteenths => "Sixteenth Builder",
+            Self::Sixteenths => Self::Eighths,
+            Self::Eighths => Self::Octants,
         }
     }
 
@@ -58,6 +53,7 @@ impl GridMode {
         match self {
             Self::Octants => "2×4 grid",
             Self::Sixteenths => "4×4 grid",
+            Self::Eighths => "8×8 grid",
         }
     }
 
@@ -65,17 +61,26 @@ impl GridMode {
         match self {
             Self::Octants => GRID_WIDTH,
             Self::Sixteenths => 13,
+            Self::Eighths => 25,
         }
     }
 
-    fn width(self) -> u16 {
-        APP_WIDTH + self.grid_width() - GRID_WIDTH
+    fn grid_height(self) -> u16 {
+        match self {
+            Self::Octants | Self::Sixteenths => GRID_HEIGHT,
+            Self::Eighths => 17,
+        }
     }
 
-    fn height(self) -> u16 {
+    fn minimum_width(self) -> u16 {
+        self.grid_width() + GRID_OUTPUT_GAP + output_width(false)
+    }
+
+    fn output_height(self) -> u16 {
         match self {
-            Self::Octants => APP_HEIGHT,
-            Self::Sixteenths => APP_HEIGHT + 2,
+            Self::Octants => 13,
+            Self::Sixteenths => 15,
+            Self::Eighths => 17,
         }
     }
 
@@ -83,6 +88,7 @@ impl GridMode {
         match self {
             Self::Octants => "b/q/Q/s/S/c",
             Self::Sixteenths => "b/q/Q/s/S/c/t",
+            Self::Eighths => "b/q/Q/s/S/c/t/k",
         }
     }
 }
@@ -107,13 +113,29 @@ fn main() -> io::Result<()> {
 struct App {
     cells: [[bool; 2]; 4],
     sixteenth_cells: [[bool; 4]; 4],
+    eighth_cells: [[bool; 8]; 8],
     mode: GridMode,
     scaling: bool,
     glyph_background: bool,
     grid_area: Option<Rect>,
     select_all_area: Option<Rect>,
     select_none_area: Option<Rect>,
+    draw_stroke: Option<DrawStroke>,
+    wheel_cursor: Option<WheelCursor>,
     should_quit: bool,
+}
+
+#[derive(Clone, Copy)]
+struct WheelCursor {
+    mode: GridMode,
+    row: usize,
+    column: usize,
+    filled: bool,
+}
+
+struct DrawStroke {
+    filled: bool,
+    last_cell: Option<(usize, usize)>,
 }
 
 impl App {
@@ -139,51 +161,64 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        let Some(layout) = AppLayout::new(frame.area(), self.mode) else {
-            self.grid_area = None;
-            self.select_all_area = None;
-            self.select_none_area = None;
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "Terminal too small (need {} x {})",
-                    self.mode.width(),
-                    self.mode.height(),
-                ))
-                .alignment(Alignment::Center),
-                frame.area(),
-            );
-            return;
+        let layout = match AppLayout::new(frame.area(), self.mode) {
+            Ok(layout) => layout,
+            Err(size) => {
+                self.draw_stroke = None;
+                self.grid_area = None;
+                self.select_all_area = None;
+                self.select_none_area = None;
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        "Terminal too small (need {} x {})",
+                        size.width, size.height,
+                    ))
+                    .alignment(Alignment::Center),
+                    frame.area(),
+                );
+                return;
+            }
         };
+        if self.grid_area != Some(layout.grid) {
+            self.draw_stroke = None;
+        }
         self.grid_area = Some(layout.grid);
         self.select_all_area = Some(layout.select_all);
         self.select_none_area = Some(layout.select_none);
 
-        frame.render_widget(
-            Paragraph::new(self.mode.title())
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::Indexed(15))),
-            layout.title,
-        );
         match self.mode {
             GridMode::Octants => frame.render_widget(CellGrid::new(&self.cells), layout.grid),
             GridMode::Sixteenths => {
                 frame.render_widget(CellGrid::new(&self.sixteenth_cells), layout.grid);
+            }
+            GridMode::Eighths => {
+                frame.render_widget(CellGrid::new(&self.eighth_cells), layout.grid);
             }
         }
         let mut glyph_style = Style::default().fg(GLYPH_COLOR);
         if self.glyph_background {
             glyph_style = glyph_style.bg(Color::Indexed(8));
         }
-        let output_text = if self.mode == GridMode::Sixteenths {
-            sixteenth_outputs_text(cells_mask(&self.sixteenth_cells), glyph_style)
+        let output_text = if self.mode == GridMode::Eighths {
+            eighth_outputs_text(
+                cells_mask(&self.eighth_cells),
+                glyph_style,
+                layout.show_codepoints,
+            )
+        } else if self.mode == GridMode::Sixteenths {
+            sixteenth_outputs_text(
+                cells_mask(&self.sixteenth_cells) as u16,
+                glyph_style,
+                layout.show_codepoints,
+            )
         } else if self.scaling {
-            scaled_outputs_text(&self.cells, glyph_style)
+            scaled_outputs_text(&self.cells, glyph_style, layout.show_codepoints)
         } else {
-            exact_outputs_text(self.mask(), glyph_style)
+            exact_outputs_text(self.mask(), glyph_style, layout.show_codepoints)
         };
         let block = Block::new().borders(Borders::ALL);
         let mut output_area = block.inner(layout.outputs);
-        if self.mode == GridMode::Sixteenths {
+        if self.mode != GridMode::Octants {
             let padding = output_area
                 .height
                 .saturating_sub(output_text.height() as u16)
@@ -195,16 +230,8 @@ impl App {
         frame.render_widget(Paragraph::new(output_text), output_area);
 
         frame.render_widget(
-            Paragraph::new(help_text(self.mode)).alignment(Alignment::Center),
+            Paragraph::new(layout.help_text).alignment(Alignment::Center),
             layout.help,
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("tab", Style::default().fg(HOTKEY_COLOR)),
-                Span::raw(format!(" {}", self.mode.other().grid_label())),
-            ]))
-            .alignment(Alignment::Center),
-            layout.switch,
         );
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -217,6 +244,10 @@ impl App {
     }
 
     fn handle_event(&mut self, event: Event) -> Option<char> {
+        // Keyboard input, paste, focus changes, and resizing end a mouse stroke.
+        if !matches!(event, Event::Mouse(_)) {
+            self.draw_stroke = None;
+        }
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 let ctrl_c =
@@ -224,7 +255,7 @@ impl App {
                 if key.code == KeyCode::Esc || ctrl_c {
                     self.should_quit = true;
                 } else if key.code == KeyCode::Tab && key.modifiers.is_empty() {
-                    self.mode = self.mode.other();
+                    self.mode = self.mode.next();
                 } else if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
                     && let KeyCode::Char(hotkey) = key.code
                 {
@@ -239,8 +270,10 @@ impl App {
                     if self.mode == GridMode::Octants && hotkey == 'b' {
                         return Some(braille_glyph(self.mask()));
                     }
-                    let outputs = if self.mode == GridMode::Sixteenths {
-                        sixteenth_outputs(cells_mask(&self.sixteenth_cells))
+                    let outputs = if self.mode == GridMode::Eighths {
+                        eighth_outputs(cells_mask(&self.eighth_cells))
+                    } else if self.mode == GridMode::Sixteenths {
+                        sixteenth_outputs(cells_mask(&self.sixteenth_cells) as u16)
                     } else if self.scaling {
                         scaled_outputs(&self.cells)
                     } else {
@@ -268,31 +301,122 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-            return;
+        let cell = self
+            .grid_area
+            .and_then(|grid| grid_cell_at(grid, mouse.column, mouse.row));
+        match mouse.kind {
+            MouseEventKind::Down(button) => {
+                self.draw_stroke = None;
+                self.wheel_cursor = None;
+                if button != MouseButton::Left {
+                    return;
+                }
+                if self
+                    .select_all_area
+                    .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+                {
+                    self.set_all(true);
+                } else if self
+                    .select_none_area
+                    .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+                {
+                    self.set_all(false);
+                } else if let Some((row, column)) = cell {
+                    self.toggle_cell(row, column);
+                    let filled = *self.cell_mut(row, column);
+                    self.draw_stroke = Some(DrawStroke {
+                        filled,
+                        last_cell: Some((row, column)),
+                    });
+                    self.wheel_cursor = Some(WheelCursor {
+                        mode: self.mode,
+                        row,
+                        column,
+                        filled,
+                    });
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some((row, column)) = cell {
+                    self.paint_to(row, column);
+                } else if self
+                    .grid_area
+                    .is_none_or(|grid| !rect_contains(grid, mouse.column, mouse.row))
+                    && let Some(stroke) = &mut self.draw_stroke
+                {
+                    // Re-entering the grid starts a new segment, without a line
+                    // across cells the pointer skipped while outside the grid.
+                    stroke.last_cell = None;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some((row, column)) = cell {
+                    self.paint_to(row, column);
+                }
+                self.draw_stroke = None;
+            }
+            MouseEventKind::Moved => self.draw_stroke = None,
+            MouseEventKind::ScrollUp => self.wheel_step(1, 0),
+            MouseEventKind::ScrollDown => self.wheel_step(-1, 0),
+            MouseEventKind::ScrollLeft => self.wheel_step(0, 1),
+            MouseEventKind::ScrollRight => self.wheel_step(0, -1),
+            _ => {}
         }
+    }
 
-        if self
-            .select_all_area
-            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
-        {
-            self.set_all(true);
-            return;
-        }
-        if self
-            .select_none_area
-            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
-        {
-            self.set_all(false);
-            return;
-        }
-
-        let Some(grid) = self.grid_area else {
+    fn wheel_step(&mut self, row_delta: isize, column_delta: isize) {
+        self.draw_stroke = None;
+        let Some(mut cursor) = self.wheel_cursor else {
             return;
         };
-        if let Some((row, column)) = grid_cell_at(grid, mouse.column, mouse.row) {
-            self.toggle_cell(row, column);
+        if cursor.mode != self.mode || self.grid_area.is_none() {
+            return;
         }
+        let (Some(row), Some(column)) = (
+            cursor.row.checked_add_signed(row_delta),
+            cursor.column.checked_add_signed(column_delta),
+        ) else {
+            return;
+        };
+        let rows = usize::from((self.mode.grid_height() - 1) / 2);
+        let columns = usize::from((self.mode.grid_width() - 1) / 3);
+        if row >= rows || column >= columns {
+            return;
+        }
+        *self.cell_mut(row, column) = cursor.filled;
+        cursor.row = row;
+        cursor.column = column;
+        self.wheel_cursor = Some(cursor);
+    }
+
+    fn paint_to(&mut self, row: usize, column: usize) {
+        let Some(mut stroke) = self.draw_stroke.take() else {
+            return;
+        };
+        let (start_row, start_column) = stroke.last_cell.unwrap_or((row, column));
+        let (mut y, mut x) = (start_row as i32, start_column as i32);
+        let (end_y, end_x) = (row as i32, column as i32);
+        let (dx, dy) = ((end_x - x).abs(), -(end_y - y).abs());
+        let (step_x, step_y) = ((end_x - x).signum(), (end_y - y).signum());
+        let mut error = dx + dy;
+        // Join sparse mouse reports so fast strokes do not leave holes.
+        loop {
+            *self.cell_mut(y as usize, x as usize) = stroke.filled;
+            if (y, x) == (end_y, end_x) {
+                break;
+            }
+            let doubled_error = 2 * error;
+            if doubled_error >= dy {
+                error += dy;
+                x += step_x;
+            }
+            if doubled_error <= dx {
+                error += dx;
+                y += step_y;
+            }
+        }
+        stroke.last_cell = Some((row, column));
+        self.draw_stroke = Some(stroke);
     }
 
     fn mask(&self) -> u8 {
@@ -300,17 +424,27 @@ impl App {
     }
 
     fn load_glyph(&mut self, glyph: char) {
-        match (self.mode, glyph_mask(glyph), sixteenths::mask(glyph)) {
-            // Shared glyphs keep the active grid; unique glyphs select their grid.
-            (GridMode::Sixteenths, _, Some(mask)) | (_, None, Some(mask)) => {
-                self.mode = GridMode::Sixteenths;
-                self.sixteenth_cells = cells_from_mask(mask);
-            }
-            (_, Some(mask), _) => {
-                self.mode = GridMode::Octants;
-                self.cells = cells_from_mask(u16::from(mask));
-            }
-            (_, None, None) => {}
+        // Shared glyphs keep the active grid; unique glyphs select their grid.
+        let octants = glyph_mask(glyph);
+        let sixteenths = sixteenths::mask(glyph);
+        let eighths = eighths::mask(glyph);
+        if self.mode == GridMode::Eighths
+            && let Some(mask) = eighths
+        {
+            self.eighth_cells = cells_from_mask(mask);
+        } else if self.mode == GridMode::Sixteenths
+            && let Some(mask) = sixteenths
+        {
+            self.sixteenth_cells = cells_from_mask(u64::from(mask));
+        } else if let Some(mask) = octants {
+            self.mode = GridMode::Octants;
+            self.cells = cells_from_mask(u64::from(mask));
+        } else if let Some(mask) = sixteenths {
+            self.mode = GridMode::Sixteenths;
+            self.sixteenth_cells = cells_from_mask(u64::from(mask));
+        } else if let Some(mask) = eighths {
+            self.mode = GridMode::Eighths;
+            self.eighth_cells = cells_from_mask(mask);
         }
     }
 
@@ -318,19 +452,25 @@ impl App {
         match self.mode {
             GridMode::Octants => self.cells.fill([filled; 2]),
             GridMode::Sixteenths => self.sixteenth_cells.fill([filled; 4]),
+            GridMode::Eighths => self.eighth_cells.fill([filled; 8]),
         }
     }
 
     fn toggle_cell(&mut self, row: usize, column: usize) {
-        let cell = match self.mode {
+        let cell = self.cell_mut(row, column);
+        *cell = !*cell;
+    }
+
+    fn cell_mut(&mut self, row: usize, column: usize) -> &mut bool {
+        match self.mode {
             GridMode::Octants => &mut self.cells[row][column],
             GridMode::Sixteenths => &mut self.sixteenth_cells[row][column],
-        };
-        *cell = !*cell;
+            GridMode::Eighths => &mut self.eighth_cells[row][column],
+        }
     }
 }
 
-fn help_text(mode: GridMode) -> Line<'static> {
+fn help_segments(mode: GridMode) -> [Line<'static>; 4] {
     let hotkey_style = Style::default().fg(HOTKEY_COLOR);
     let mut spans: Vec<_> = mode
         .copy_hotkeys()
@@ -344,29 +484,75 @@ fn help_text(mode: GridMode) -> Line<'static> {
             Span::styled(letter.to_string(), style)
         })
         .collect();
-    spans.extend([
-        Span::raw(" copy • select "),
-        Span::styled("a", hotkey_style),
-        Span::raw("ll/"),
-        Span::styled("n", hotkey_style),
-        Span::raw("one • back"),
-        Span::styled("g", hotkey_style),
-        Span::raw("round"),
-    ]);
-    Line::from(spans)
+    spans.push(Span::raw(" copy"));
+    [
+        Line::from(spans),
+        Line::from(vec![
+            Span::raw("select "),
+            Span::styled("a", hotkey_style),
+            Span::raw("ll/"),
+            Span::styled("n", hotkey_style),
+            Span::raw("one"),
+        ]),
+        Line::from(vec![
+            Span::raw("back"),
+            Span::styled("g", hotkey_style),
+            Span::raw("round"),
+        ]),
+        Line::from(vec![
+            Span::styled("tab", hotkey_style),
+            Span::raw(format!(" {}", mode.next().grid_label())),
+        ]),
+    ]
 }
 
-fn cells_mask<const COLUMNS: usize>(cells: &[[bool; COLUMNS]; 4]) -> u16 {
+struct KeyHints {
+    text: Text<'static>,
+    selection_row: u16,
+    selection_column: u16,
+}
+
+fn key_hints(mode: GridMode, width: u16) -> KeyHints {
+    let mut lines = Vec::new();
+    let mut line = Line::default();
+    let mut selection_row = 0;
+    let mut selection_column = 0;
+    let separator = " • ";
+    let separator_width = Line::from(separator).width();
+    for (index, segment) in help_segments(mode).into_iter().enumerate() {
+        if line.width() > 0 && line.width() + separator_width + segment.width() > usize::from(width)
+        {
+            lines.push(line);
+            line = Line::default();
+        }
+        if line.width() > 0 {
+            line.push_span(separator);
+        }
+        if index == 1 {
+            selection_row = lines.len() as u16;
+            selection_column = (line.width() + Line::from("select ").width()) as u16;
+        }
+        line.spans.extend(segment.spans);
+    }
+    lines.push(line);
+    KeyHints {
+        text: Text::from(lines),
+        selection_row,
+        selection_column,
+    }
+}
+
+fn cells_mask<const COLUMNS: usize, const ROWS: usize>(cells: &[[bool; COLUMNS]; ROWS]) -> u64 {
     cells
         .iter()
         .flatten()
         .enumerate()
         .fold(0, |mask, (index, filled)| {
-            mask | (u16::from(*filled) << index)
+            mask | (u64::from(*filled) << index)
         })
 }
 
-fn cells_from_mask<const COLUMNS: usize>(mask: u16) -> [[bool; COLUMNS]; 4] {
+fn cells_from_mask<const COLUMNS: usize, const ROWS: usize>(mask: u64) -> [[bool; COLUMNS]; ROWS] {
     std::array::from_fn(|row| {
         std::array::from_fn(|column| mask & (1 << (row * COLUMNS + column)) != 0)
     })
@@ -418,8 +604,8 @@ fn exact_outputs(mask: u8) -> Vec<CharacterOutput> {
     outputs
 }
 
-fn exact_outputs_text(mask: u8, glyph_style: Style) -> Text<'static> {
-    outputs_text(exact_outputs(mask), glyph_style)
+fn exact_outputs_text(mask: u8, glyph_style: Style, show_codepoints: bool) -> Text<'static> {
+    outputs_text(exact_outputs(mask), glyph_style, show_codepoints)
 }
 
 fn sixteenth_outputs(mask: u16) -> Vec<CharacterOutput> {
@@ -436,20 +622,51 @@ fn sixteenth_outputs(mask: u16) -> Vec<CharacterOutput> {
     outputs
 }
 
-fn sixteenth_outputs_text(mask: u16, glyph_style: Style) -> Text<'static> {
+fn sixteenth_outputs_text(mask: u16, glyph_style: Style, show_codepoints: bool) -> Text<'static> {
     let outputs = sixteenth_outputs(mask);
     if !outputs.is_empty() {
-        outputs_text(outputs, glyph_style)
+        outputs_text(outputs, glyph_style, show_codepoints)
     } else {
-        Text::from(vec![
-            output_label("Sixteenth", 't'),
-            Line::default(),
-            Line::styled(
-                " No single Unicode glyph",
-                Style::default().fg(Color::Indexed(8)),
-            ),
-        ])
+        unavailable_output_text("Sixteenth", 't', show_codepoints)
     }
+}
+
+fn eighth_outputs(mask: u64) -> Vec<CharacterOutput> {
+    let mut outputs = eighths::sixteenth_mask(mask)
+        .map(sixteenth_outputs)
+        .unwrap_or_default();
+    if let Some(glyph) = eighths::glyph(mask) {
+        outputs.push(CharacterOutput {
+            name: "Block",
+            hotkey: 'k',
+            glyph,
+        });
+    }
+    outputs
+}
+
+fn eighth_outputs_text(mask: u64, glyph_style: Style, show_codepoints: bool) -> Text<'static> {
+    let outputs = eighth_outputs(mask);
+    if !outputs.is_empty() {
+        outputs_text(outputs, glyph_style, show_codepoints)
+    } else {
+        unavailable_output_text("Block", 'k', show_codepoints)
+    }
+}
+
+fn unavailable_output_text(name: &str, hotkey: char, show_codepoints: bool) -> Text<'static> {
+    Text::from(vec![
+        output_label(name, hotkey),
+        Line::default(),
+        Line::styled(
+            if show_codepoints {
+                " No single Unicode glyph"
+            } else {
+                " No Unicode glyph"
+            },
+            Style::default().fg(Color::Indexed(8)),
+        ),
+    ])
 }
 
 fn output_label(name: &str, hotkey: char) -> Line<'static> {
@@ -477,19 +694,40 @@ fn output_label(name: &str, hotkey: char) -> Line<'static> {
     line
 }
 
-fn outputs_text(outputs: Vec<CharacterOutput>, glyph_style: Style) -> Text<'static> {
+fn output_glyph_column(show_codepoints: bool) -> usize {
+    if show_codepoints {
+        OUTPUT_GLYPH_COLUMN
+    } else {
+        OUTPUT_CODEPOINT_COLUMN
+    }
+}
+
+fn output_width(show_codepoints: bool) -> u16 {
+    // Borders, a glyph (up to two cells for halfblocks), and trailing padding.
+    output_glyph_column(show_codepoints) as u16 + 5
+}
+
+fn outputs_text(
+    outputs: Vec<CharacterOutput>,
+    glyph_style: Style,
+    show_codepoints: bool,
+) -> Text<'static> {
     let mut lines = Vec::new();
     for output in outputs {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
         let mut line = output_label(output.name, output.hotkey);
-        line.push_span(" ".repeat(OUTPUT_CODEPOINT_COLUMN.saturating_sub(line.width())));
-        line.push_span(Span::styled(
-            format!("U+{:04X}", output.glyph as u32),
-            Style::default().fg(Color::Indexed(8)),
-        ));
-        line.push_span(" ".repeat(OUTPUT_GLYPH_COLUMN.saturating_sub(line.width())));
+        if show_codepoints {
+            line.push_span(" ".repeat(OUTPUT_CODEPOINT_COLUMN.saturating_sub(line.width())));
+            line.push_span(Span::styled(
+                format!("U+{:04X}", output.glyph as u32),
+                Style::default().fg(Color::Indexed(8)),
+            ));
+        }
+        line.push_span(
+            " ".repeat(output_glyph_column(show_codepoints).saturating_sub(line.width())),
+        );
         line.push_span(Span::styled(output.glyph.to_string(), glyph_style));
         lines.push(line);
     }
@@ -526,12 +764,16 @@ fn scaled_outputs(cells: &[[bool; 2]; 4]) -> Vec<CharacterOutput> {
     ]
 }
 
-fn scaled_outputs_text(cells: &[[bool; 2]; 4], glyph_style: Style) -> Text<'static> {
-    let mut outputs = outputs_text(scaled_outputs(cells), glyph_style);
+fn scaled_outputs_text(
+    cells: &[[bool; 2]; 4],
+    glyph_style: Style,
+    show_codepoints: bool,
+) -> Text<'static> {
+    let mut outputs = outputs_text(scaled_outputs(cells), glyph_style, show_codepoints);
     let halfblock = halfblock_output(vertically_scaled_mask(cells, 2));
     outputs.lines.push(Line::default());
     let mut line = Line::from(" halfblock");
-    line.push_span(" ".repeat(OUTPUT_GLYPH_COLUMN.saturating_sub(line.width())));
+    line.push_span(" ".repeat(output_glyph_column(show_codepoints).saturating_sub(line.width())));
     line.push_span(Span::styled(halfblock, glyph_style));
     outputs.lines.push(line);
     outputs
@@ -609,51 +851,70 @@ impl Drop for InputModes {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AppLayout {
-    title: Rect,
     grid: Rect,
     select_all: Rect,
     select_none: Rect,
     outputs: Rect,
     help: Rect,
-    switch: Rect,
+    help_text: Text<'static>,
     quit: Rect,
+    show_codepoints: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MinimumSize {
+    width: u16,
+    height: u16,
 }
 
 impl AppLayout {
-    fn new(area: Rect, mode: GridMode) -> Option<Self> {
-        let width = mode.width();
-        let height = mode.height();
-        let outputs_height = height - 6;
-        if area.width < width || area.height < height {
-            return None;
+    fn new(area: Rect, mode: GridMode) -> Result<Self, MinimumSize> {
+        let minimum_width = mode.minimum_width();
+        let hints = key_hints(mode, area.width.max(minimum_width));
+        let outputs_height = mode.output_height();
+        let hints_height = hints.text.height() as u16;
+        let height = outputs_height + 1 + hints_height + 1;
+        if area.width < minimum_width || area.height < height {
+            return Err(MinimumSize {
+                width: area.width.max(minimum_width),
+                height,
+            });
         }
 
-        let x = area.x + (area.width - width) / 2;
+        let show_codepoints =
+            area.width >= mode.grid_width() + GRID_OUTPUT_GAP + output_width(true);
+        let outputs_width = output_width(show_codepoints);
+        let body_width = mode.grid_width() + GRID_OUTPUT_GAP + outputs_width;
+        let x = area.x + (area.width - body_width) / 2;
         let y = area.y + (area.height - height) / 2;
-        let help_x = x + (width - help_text(mode).width() as u16) / 2;
+        let help = Rect::new(area.x, y + outputs_height + 1, area.width, hints_height);
+        let selection_line_width =
+            hints.text.lines[usize::from(hints.selection_row)].width() as u16;
+        // Match Paragraph's centering when the line and area have different parity.
         let select_all_x =
-            help_x + Line::from(format!("{} copy • select ", mode.copy_hotkeys())).width() as u16;
-        Some(Self {
-            title: Rect::new(x, y, width, 1),
+            help.x + help.width / 2 - selection_line_width / 2 + hints.selection_column;
+        let selection_y = help.y + hints.selection_row;
+        Ok(Self {
             grid: Rect::new(
-                x + 4,
-                y + 2 + (outputs_height - GRID_HEIGHT) / 2,
+                x,
+                y + (outputs_height - mode.grid_height()) / 2,
                 mode.grid_width(),
-                GRID_HEIGHT,
+                mode.grid_height(),
             ),
-            select_all: Rect::new(select_all_x, y + height - 3, 3, 1),
-            select_none: Rect::new(select_all_x + 4, y + height - 3, 4, 1),
+            select_all: Rect::new(select_all_x, selection_y, 3, 1),
+            select_none: Rect::new(select_all_x + 4, selection_y, 4, 1),
             outputs: Rect::new(
-                x + 14 + mode.grid_width() - GRID_WIDTH,
-                y + 2,
-                28,
+                x + mode.grid_width() + GRID_OUTPUT_GAP,
+                y,
+                outputs_width,
                 outputs_height,
             ),
-            help: Rect::new(x, y + height - 3, width, 1),
-            switch: Rect::new(x, y + height - 2, width, 1),
-            quit: Rect::new(x, y + height - 1, width, 1),
+            help,
+            help_text: hints.text,
+            quit: Rect::new(area.x, y + height - 1, area.width, 1),
+            show_codepoints,
         })
     }
 }
@@ -662,19 +923,19 @@ fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
     x >= area.x && x < area.right() && y >= area.y && y < area.bottom()
 }
 
-struct CellGrid<'a, const COLUMNS: usize> {
-    cells: &'a [[bool; COLUMNS]; 4],
+struct CellGrid<'a, const COLUMNS: usize, const ROWS: usize> {
+    cells: &'a [[bool; COLUMNS]; ROWS],
 }
 
-impl<'a, const COLUMNS: usize> CellGrid<'a, COLUMNS> {
-    fn new(cells: &'a [[bool; COLUMNS]; 4]) -> Self {
+impl<'a, const COLUMNS: usize, const ROWS: usize> CellGrid<'a, COLUMNS, ROWS> {
+    fn new(cells: &'a [[bool; COLUMNS]; ROWS]) -> Self {
         Self { cells }
     }
 }
 
-impl<const COLUMNS: usize> Widget for CellGrid<'_, COLUMNS> {
+impl<const COLUMNS: usize, const ROWS: usize> Widget for CellGrid<'_, COLUMNS, ROWS> {
     fn render(self, area: Rect, buffer: &mut Buffer) {
-        if area.width < COLUMNS as u16 * 3 + 1 || area.height < GRID_HEIGHT {
+        if area.width < COLUMNS as u16 * 3 + 1 || area.height < ROWS as u16 * 2 + 1 {
             return;
         }
 
@@ -682,13 +943,19 @@ impl<const COLUMNS: usize> Widget for CellGrid<'_, COLUMNS> {
         let middle = format!("├{}┤", ["──"; COLUMNS].join("┼"));
         let bottom = format!("└{}┘", ["──"; COLUMNS].join("┴"));
         let cell_row = format!("│{}│", ["  "; COLUMNS].join("│"));
-        let border_rows = [&top, &middle, &middle, &middle, &bottom];
         let border_style = Style::default().fg(Color::DarkGray);
         let filled_style = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
 
-        for (row, border) in border_rows.iter().enumerate() {
+        for row in 0..=ROWS {
+            let border = if row == 0 {
+                &top
+            } else if row == ROWS {
+                &bottom
+            } else {
+                &middle
+            };
             buffer.set_string(area.x, area.y + row as u16 * 2, border, border_style);
         }
         for (row, cells) in self.cells.iter().enumerate() {
@@ -852,6 +1119,318 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn mouse_on_cell(app: &mut App, kind: MouseEventKind, row: usize, column: usize) {
+        let grid = app.grid_area.unwrap();
+        app.handle_event(mouse_event(
+            kind,
+            grid.x + column as u16 * 3 + 1,
+            grid.y + row as u16 * 2 + 1,
+        ));
+    }
+
+    fn active_mask(app: &App) -> u64 {
+        match app.mode {
+            GridMode::Octants => cells_mask(&app.cells),
+            GridMode::Sixteenths => cells_mask(&app.sixteenth_cells),
+            GridMode::Eighths => cells_mask(&app.eighth_cells),
+        }
+    }
+
+    #[test]
+    fn mouse_strokes_paint_and_erase_without_repeatedly_toggling_cells() {
+        for mode in [GridMode::Octants, GridMode::Sixteenths, GridMode::Eighths] {
+            let mut app = App {
+                mode,
+                grid_area: Some(Rect::new(5, 3, mode.grid_width(), mode.grid_height())),
+                ..App::new(false)
+            };
+            let columns = usize::from((mode.grid_width() - 1) / 3);
+            let rows = usize::from((mode.grid_height() - 1) / 2);
+            // Painting through an already filled cell must leave it filled.
+            app.toggle_cell(0, columns - 1);
+            mouse_on_cell(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+            for column in [0, columns - 1, 0, columns - 1] {
+                mouse_on_cell(&mut app, MouseEventKind::Drag(MouseButton::Left), 0, column);
+            }
+            mouse_on_cell(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                0,
+                columns - 1,
+            );
+            assert_eq!(active_mask(&app), (1 << columns) - 1);
+            assert!(app.draw_stroke.is_none());
+
+            mouse_on_cell(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                0,
+                columns - 1,
+            );
+            mouse_on_cell(&mut app, MouseEventKind::Drag(MouseButton::Left), 0, 0);
+            mouse_on_cell(
+                &mut app,
+                MouseEventKind::Drag(MouseButton::Left),
+                0,
+                columns - 1,
+            );
+            mouse_on_cell(&mut app, MouseEventKind::Up(MouseButton::Left), 0, 0);
+            assert_eq!(active_mask(&app), 0);
+
+            // A normal click still toggles once; dragging after release does nothing.
+            mouse_on_cell(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                rows - 1,
+                columns - 1,
+            );
+            mouse_on_cell(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                rows - 1,
+                columns - 1,
+            );
+            mouse_on_cell(&mut app, MouseEventKind::Drag(MouseButton::Left), 0, 0);
+            assert_eq!(active_mask(&app), 1 << (rows * columns - 1));
+        }
+    }
+
+    #[test]
+    fn wheeling_repeats_the_clicked_paint_or_erase_operation_from_each_new_cell() {
+        for mode in [GridMode::Octants, GridMode::Sixteenths, GridMode::Eighths] {
+            let mut app = App {
+                mode,
+                grid_area: Some(Rect::new(10, 5, mode.grid_width(), mode.grid_height())),
+                ..App::new(false)
+            };
+            let columns = usize::from((mode.grid_width() - 1) / 3);
+            mouse_on_cell(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+            mouse_on_cell(&mut app, MouseEventKind::Up(MouseButton::Left), 0, 0);
+            // Wheel coordinates and pointer motion do not replace the logical origin.
+            app.handle_event(mouse_event(MouseEventKind::Moved, 70, 25));
+            for kind in [
+                MouseEventKind::ScrollUp,
+                MouseEventKind::ScrollLeft,
+                MouseEventKind::ScrollDown,
+                MouseEventKind::ScrollRight,
+            ] {
+                app.handle_event(mouse_event(kind, 70, 25));
+            }
+            let square = 3 | (3 << columns);
+            assert_eq!(active_mask(&app), square);
+            let cursor = app.wheel_cursor.unwrap();
+            assert_eq!((cursor.row, cursor.column), (0, 0));
+            app.handle_event(mouse_event(MouseEventKind::ScrollUp, 70, 25));
+            app.handle_event(mouse_event(MouseEventKind::ScrollUp, 70, 25));
+            assert_eq!(active_mask(&app), square | (1 << (columns * 2)));
+
+            // Clicking an existing cell changes the operation to erasing.
+            mouse_on_cell(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+            mouse_on_cell(&mut app, MouseEventKind::Up(MouseButton::Left), 0, 0);
+            for kind in [
+                MouseEventKind::ScrollLeft,
+                MouseEventKind::ScrollUp,
+                MouseEventKind::ScrollRight,
+                MouseEventKind::ScrollUp,
+            ] {
+                app.handle_event(mouse_event(kind, 70, 25));
+            }
+            assert_eq!(active_mask(&app), 0);
+            assert!(!app.wheel_cursor.unwrap().filled);
+        }
+    }
+
+    #[test]
+    fn wheel_movement_stops_at_grid_edges_and_needs_a_cell_click() {
+        for mode in [GridMode::Octants, GridMode::Sixteenths, GridMode::Eighths] {
+            let mut app = App {
+                mode,
+                grid_area: Some(Rect::new(10, 5, mode.grid_width(), mode.grid_height())),
+                select_none_area: Some(Rect::new(0, 0, 4, 1)),
+                ..App::new(false)
+            };
+            let rows = usize::from((mode.grid_height() - 1) / 2);
+            let columns = usize::from((mode.grid_width() - 1) / 3);
+            app.handle_event(mouse_event(MouseEventKind::ScrollUp, 0, 0));
+            assert_eq!(active_mask(&app), 0);
+            mouse_on_cell(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+            mouse_on_cell(&mut app, MouseEventKind::Up(MouseButton::Left), 0, 0);
+            for kind in [MouseEventKind::ScrollDown, MouseEventKind::ScrollRight] {
+                app.handle_event(mouse_event(kind, 0, 0));
+            }
+            assert_eq!(active_mask(&app), 1);
+            for _ in 0..rows + 2 {
+                app.handle_event(mouse_event(MouseEventKind::ScrollUp, 0, 0));
+            }
+            for _ in 0..columns + 2 {
+                app.handle_event(mouse_event(MouseEventKind::ScrollLeft, 0, 0));
+            }
+            let cursor = app.wheel_cursor.unwrap();
+            assert_eq!((cursor.row, cursor.column), (rows - 1, columns - 1));
+            app.handle_event(mouse_event(MouseEventKind::ScrollDown, 0, 0));
+            let cursor = app.wheel_cursor.unwrap();
+            assert_eq!((cursor.row, cursor.column), (rows - 2, columns - 1));
+
+            // A footer click clears the grid and replaces the previous cell origin.
+            app.handle_event(mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0));
+            assert!(app.wheel_cursor.is_none());
+            app.handle_event(mouse_event(MouseEventKind::ScrollDown, 0, 0));
+            assert_eq!(active_mask(&app), 0);
+        }
+    }
+
+    #[test]
+    fn dragging_keeps_the_wheel_origin_at_the_last_clicked_cell() {
+        let mut app = App {
+            mode: GridMode::Eighths,
+            grid_area: Some(Rect::new(0, 0, 25, 17)),
+            ..App::new(false)
+        };
+        mouse_on_cell(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+        mouse_on_cell(&mut app, MouseEventKind::Drag(MouseButton::Left), 0, 7);
+        mouse_on_cell(&mut app, MouseEventKind::Up(MouseButton::Left), 0, 7);
+        app.handle_event(mouse_event(MouseEventKind::ScrollUp, 24, 16));
+        assert_eq!(active_mask(&app), 0x01FF);
+        mouse_on_cell(&mut app, MouseEventKind::Down(MouseButton::Left), 7, 7);
+        mouse_on_cell(&mut app, MouseEventKind::Up(MouseButton::Left), 7, 7);
+        app.handle_event(mouse_event(MouseEventKind::ScrollDown, 0, 0));
+        assert_eq!(active_mask(&app), 0x8080_0000_0000_01FF);
+    }
+
+    #[test]
+    fn wheel_origin_survives_redraw_and_copy_but_only_affects_its_grid() {
+        let backend = ratatui::backend::TestBackend::new(80, 28);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = App {
+            mode: GridMode::Eighths,
+            ..App::new(false)
+        };
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        mouse_on_cell(&mut app, MouseEventKind::Down(MouseButton::Left), 1, 3);
+        mouse_on_cell(&mut app, MouseEventKind::Up(MouseButton::Left), 1, 3);
+        app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::NONE,
+        )));
+        terminal.backend_mut().resize(47, 21);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        app.handle_event(mouse_event(MouseEventKind::ScrollUp, 0, 0));
+        assert_eq!(active_mask(&app), (1 << 11) | (1 << 19));
+        for expected_mode in [GridMode::Octants, GridMode::Sixteenths] {
+            app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+            )));
+            assert_eq!(app.mode, expected_mode);
+            app.handle_event(mouse_event(MouseEventKind::ScrollLeft, 0, 0));
+            assert_eq!(active_mask(&app), 0);
+        }
+        app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+        app.handle_event(mouse_event(MouseEventKind::ScrollLeft, 0, 0));
+        assert_eq!(active_mask(&app), (1 << 11) | (1 << 19) | (1 << 20));
+    }
+
+    #[test]
+    fn sparse_strokes_join_vertical_and_diagonal_cells_and_include_the_release_position() {
+        let mut app = App {
+            mode: GridMode::Eighths,
+            grid_area: Some(Rect::new(0, 0, 25, 17)),
+            ..App::new(false)
+        };
+        mouse_on_cell(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 4);
+        mouse_on_cell(&mut app, MouseEventKind::Up(MouseButton::Left), 7, 4);
+        assert_eq!(active_mask(&app), 0x1010_1010_1010_1010);
+        assert_eq!(eighths::glyph(active_mask(&app)), Some('\u{1FB73}'));
+
+        app.set_all(false);
+        mouse_on_cell(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+        mouse_on_cell(&mut app, MouseEventKind::Drag(MouseButton::Left), 7, 7);
+        mouse_on_cell(&mut app, MouseEventKind::Up(MouseButton::Left), 7, 7);
+        assert_eq!(active_mask(&app), 0x8040_2010_0804_0201);
+    }
+
+    #[test]
+    fn dragging_over_separators_and_outside_the_grid_does_not_activate_other_controls() {
+        let grid = Rect::new(10, 10, 25, 17);
+        let mut app = App {
+            mode: GridMode::Eighths,
+            grid_area: Some(grid),
+            select_none_area: Some(Rect::new(0, 0, 4, 1)),
+            ..App::new(false)
+        };
+        mouse_on_cell(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+        app.handle_event(mouse_event(
+            MouseEventKind::Drag(MouseButton::Left),
+            grid.x + 3,
+            grid.y + 1,
+        ));
+        mouse_on_cell(&mut app, MouseEventKind::Drag(MouseButton::Left), 0, 2);
+        assert_eq!(active_mask(&app), 7);
+        app.handle_event(mouse_event(MouseEventKind::Drag(MouseButton::Left), 0, 0));
+        assert_eq!(active_mask(&app), 7);
+        mouse_on_cell(&mut app, MouseEventKind::Drag(MouseButton::Left), 7, 7);
+        assert_eq!(active_mask(&app), (1 << 63) | 7);
+        app.handle_event(mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 0));
+        mouse_on_cell(&mut app, MouseEventKind::Drag(MouseButton::Left), 6, 6);
+        assert_eq!(active_mask(&app), (1 << 63) | 7);
+
+        // A footer press performs its action, but cannot start a drawing stroke.
+        app.handle_event(mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        mouse_on_cell(&mut app, MouseEventKind::Drag(MouseButton::Left), 1, 1);
+        assert_eq!(active_mask(&app), 0);
+        mouse_on_cell(&mut app, MouseEventKind::Down(MouseButton::Right), 0, 0);
+        mouse_on_cell(&mut app, MouseEventKind::Drag(MouseButton::Right), 7, 7);
+        assert_eq!(active_mask(&app), 0);
+    }
+
+    #[test]
+    fn non_mouse_input_and_layout_changes_cancel_drawing() {
+        for event in [
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+            )),
+            Event::Resize(47, 21),
+            Event::Paste("\u{1FB73}".to_owned()),
+            Event::FocusLost,
+        ] {
+            let mut app = App {
+                mode: GridMode::Eighths,
+                grid_area: Some(Rect::new(0, 0, 25, 17)),
+                ..App::new(false)
+            };
+            mouse_on_cell(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+            assert!(app.draw_stroke.is_some());
+            app.handle_event(event);
+            assert!(app.draw_stroke.is_none());
+            let mask = active_mask(&app);
+            mouse_on_cell(&mut app, MouseEventKind::Drag(MouseButton::Left), 0, 1);
+            assert_eq!(active_mask(&app), mask);
+        }
+
+        let backend = ratatui::backend::TestBackend::new(80, 28);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = App::new(false);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        mouse_on_cell(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert!(app.draw_stroke.is_some());
+        terminal.backend_mut().resize(47, 21);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert!(app.draw_stroke.is_none());
+    }
 
     #[test]
     fn scaling_is_opt_in() {
@@ -1137,11 +1716,15 @@ mod tests {
             assert_eq!(app.handle_event(copy.clone()), Some('\u{1CEA3}'));
 
             app.handle_event(tab.clone());
+            assert_eq!(app.mode, GridMode::Eighths);
+            app.toggle_cell(7, 7);
+            app.handle_event(tab.clone());
             assert_eq!(app.mode, GridMode::Octants);
             assert_eq!(app.mask(), 0x08);
             app.handle_event(tab);
             assert_eq!(app.mode, GridMode::Sixteenths);
             assert_eq!(cells_mask(&app.sixteenth_cells), 0x3000);
+            assert_eq!(cells_mask(&app.eighth_cells), 1 << 63);
 
             app.set_all(true);
             assert_eq!(app.handle_event(copy.clone()), Some('█'));
@@ -1151,9 +1734,13 @@ mod tests {
             app.toggle_cell(3, 0);
             assert_eq!(app.handle_event(copy), None);
             assert!(
-                sixteenth_outputs_text(cells_mask(&app.sixteenth_cells), Style::default())
-                    .to_string()
-                    .contains("No single Unicode glyph")
+                sixteenth_outputs_text(
+                    cells_mask(&app.sixteenth_cells) as u16,
+                    Style::default(),
+                    true
+                )
+                .to_string()
+                .contains("No single Unicode glyph")
             );
             assert_eq!(app.mask(), 0x08);
             assert!(!app.should_quit);
@@ -1300,7 +1887,7 @@ mod tests {
             }
         }
 
-        let cells = cells_from_mask::<4>(0x9000);
+        let cells = cells_from_mask::<4, 4>(0x9000);
         let mut buffer = Buffer::empty(grid);
         CellGrid::new(&cells).render(grid, &mut buffer);
         for x in [11, 12, 20, 21] {
@@ -1308,6 +1895,136 @@ mod tests {
         }
         assert_eq!(buffer[(19, 27)].symbol(), "│");
         assert_eq!(buffer[(22, 27)].symbol(), "│");
+    }
+
+    #[test]
+    fn eight_by_eight_copy_matches_coarser_categories_and_ignores_partial_groups() {
+        for scaling in [false, true] {
+            let compact = 0x00F0;
+            let expanded = eighths::expand_sixteenths(compact);
+            let mut outputs = sixteenth_outputs(compact);
+            outputs.push(CharacterOutput {
+                name: "Block",
+                hotkey: 'k',
+                glyph: '\u{1CD06}',
+            });
+            assert_eq!(eighth_outputs(expanded), outputs);
+            let mut app = App {
+                eighth_cells: cells_from_mask(expanded),
+                mode: GridMode::Eighths,
+                ..App::new(scaling)
+            };
+            let key = |hotkey| {
+                Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char(hotkey),
+                    if hotkey.is_ascii_uppercase() {
+                        KeyModifiers::SHIFT
+                    } else {
+                        KeyModifiers::NONE
+                    },
+                ))
+            };
+            for output in outputs {
+                assert_eq!(app.handle_event(key(output.hotkey)), Some(output.glyph));
+            }
+            app.eighth_cells = cells_from_mask(0x1010_1010_1010_1010);
+            assert_eq!(app.handle_event(key('k')), Some('\u{1FB73}'));
+            for hotkey in ['b', 'q', 'Q', 's', 'S', 'c', 't'] {
+                assert_eq!(app.handle_event(key(hotkey)), None);
+            }
+            app.toggle_cell(0, 4);
+            assert_eq!(app.handle_event(key('k')), None);
+            assert!(
+                eighth_outputs_text(cells_mask(&app.eighth_cells), Style::default(), true)
+                    .to_string()
+                    .contains("No single Unicode glyph")
+            );
+            app.handle_event(key('a'));
+            assert_eq!(cells_mask(&app.eighth_cells), u64::MAX);
+            assert_eq!(app.handle_event(key('k')), Some('█'));
+            app.handle_event(key('n'));
+            assert_eq!(cells_mask(&app.eighth_cells), 0);
+            assert_eq!(app.handle_event(key('k')), Some('\u{00A0}'));
+        }
+    }
+
+    #[test]
+    fn eighth_paste_loads_native_geometry_and_shared_glyphs_stay_on_the_grid() {
+        let mut app = App::new(false);
+        for (glyph, expected) in [
+            ('\u{1FB70}', 0x0202_0202_0202_0202),
+            ('\u{1FB76}', 0x0000_0000_0000_FF00),
+            ('\u{1FB83}', 0x0000_0000_00FF_FFFF),
+            ('\u{1FB7C}', 0xFF01_0101_0101_0101),
+        ] {
+            for event in [
+                Event::Paste(glyph.to_string()),
+                Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char(glyph),
+                    KeyModifiers::NONE,
+                )),
+            ] {
+                app.mode = GridMode::Octants;
+                app.handle_event(event);
+                assert_eq!(app.mode, GridMode::Eighths);
+                assert_eq!(cells_mask(&app.eighth_cells), expected);
+            }
+        }
+        for glyph in ['\u{1CE9C}', '▗', '█', ' ', '\u{00A0}'] {
+            app.handle_event(Event::Paste(glyph.to_string()));
+            assert_eq!(app.mode, GridMode::Eighths);
+            assert_eq!(cells_mask(&app.eighth_cells), eighths::mask(glyph).unwrap());
+        }
+        app.handle_event(Event::Paste("\u{2810}".to_owned()));
+        assert_eq!(app.mode, GridMode::Octants);
+        assert_eq!(app.mask(), 0x08);
+    }
+
+    #[test]
+    fn eight_by_eight_hit_testing_and_rendering_include_all_sixty_four_cells() {
+        let grid = Rect::new(3, 5, 25, 17);
+        let mut app = App {
+            mode: GridMode::Eighths,
+            grid_area: Some(grid),
+            ..App::new(false)
+        };
+        for row in 0..8 {
+            for column in 0..8 {
+                let x = grid.x + column * 3 + 1;
+                let y = grid.y + row * 2 + 1;
+                assert_eq!(
+                    grid_cell_at(grid, x, y),
+                    Some((usize::from(row), usize::from(column)))
+                );
+                app.handle_mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: x,
+                    row: y,
+                    modifiers: KeyModifiers::NONE,
+                });
+            }
+        }
+        assert_eq!(cells_mask(&app.eighth_cells), u64::MAX);
+        let mut buffer = Buffer::empty(grid);
+        CellGrid::new(&app.eighth_cells).render(grid, &mut buffer);
+        for row in 0..8 {
+            for column in 0..8 {
+                for offset in [1, 2] {
+                    assert_eq!(
+                        buffer[(grid.x + column * 3 + offset, grid.y + row * 2 + 1)].symbol(),
+                        "█"
+                    );
+                }
+            }
+        }
+        for y in grid.y..grid.bottom() {
+            for x in grid.x..grid.right() {
+                if (x - grid.x).is_multiple_of(3) || (y - grid.y).is_multiple_of(2) {
+                    assert_eq!(grid_cell_at(grid, x, y), None);
+                }
+            }
+        }
+        assert_eq!(buffer[(grid.right() - 1, grid.bottom() - 1)].symbol(), "┘");
     }
 
     #[test]
@@ -1361,8 +2078,7 @@ mod tests {
 
     #[test]
     fn footer_clicks_select_all_and_none() {
-        let layout =
-            AppLayout::new(Rect::new(0, 0, APP_WIDTH, APP_HEIGHT), GridMode::Octants).unwrap();
+        let layout = AppLayout::new(Rect::new(0, 0, 80, 24), GridMode::Octants).unwrap();
         let mut app = App {
             select_all_area: Some(layout.select_all),
             select_none_area: Some(layout.select_none),
@@ -1440,28 +2156,141 @@ mod tests {
     fn layout_is_centered_and_rejects_small_terminals() {
         let layout = AppLayout::new(Rect::new(0, 0, 59, 23), GridMode::Octants).unwrap();
 
-        assert_eq!(layout.title, Rect::new(6, 2, APP_WIDTH, 1));
-        assert_eq!(layout.grid, Rect::new(10, 6, GRID_WIDTH, GRID_HEIGHT));
-        assert_eq!(layout.select_all, Rect::new(32, 18, 3, 1));
-        assert_eq!(layout.select_none, Rect::new(36, 18, 4, 1));
-        assert_eq!(layout.outputs, Rect::new(20, 4, 28, 13));
-        assert_eq!(layout.switch, Rect::new(6, 19, APP_WIDTH, 1));
-        assert_eq!(layout.quit, Rect::new(6, 20, APP_WIDTH, 1));
-        for mode in [GridMode::Octants, GridMode::Sixteenths] {
-            assert!(
-                AppLayout::new(Rect::new(0, 0, mode.width() - 1, mode.height()), mode).is_none()
-            );
-            assert!(
-                AppLayout::new(Rect::new(0, 0, mode.width(), mode.height() - 1), mode).is_none()
-            );
-            assert!(AppLayout::new(Rect::new(0, 0, mode.width(), mode.height()), mode).is_some());
+        assert_eq!(layout.grid, Rect::new(10, 5, GRID_WIDTH, GRID_HEIGHT));
+        assert_eq!(layout.select_all, Rect::new(32, 17, 3, 1));
+        assert_eq!(layout.select_none, Rect::new(36, 17, 4, 1));
+        assert_eq!(layout.outputs, Rect::new(20, 3, 28, 13));
+        assert_eq!(layout.help, Rect::new(0, 17, 59, 2));
+        assert_eq!(layout.quit, Rect::new(0, 19, 59, 1));
+        for (mode, width, height, hint_rows) in [
+            (GridMode::Octants, 29, 18, 3),
+            (GridMode::Sixteenths, 35, 20, 3),
+            (GridMode::Eighths, 47, 21, 2),
+        ] {
+            assert!(AppLayout::new(Rect::new(0, 0, width - 1, height), mode).is_err());
+            assert!(AppLayout::new(Rect::new(0, 0, width, height - 1), mode).is_err());
+            let layout = AppLayout::new(Rect::new(0, 0, width, height), mode).unwrap();
+            assert!(!layout.show_codepoints);
+            assert_eq!(layout.help.height, hint_rows);
+            assert_eq!(layout.quit.bottom(), height);
         }
         let layout = AppLayout::new(Rect::new(0, 0, 59, 23), GridMode::Sixteenths).unwrap();
-        assert_eq!(layout.title, Rect::new(3, 1, 53, 1));
-        assert_eq!(layout.grid, Rect::new(7, 6, 13, 9));
-        assert_eq!(layout.outputs, Rect::new(23, 3, 28, 15));
-        assert_eq!(layout.help, Rect::new(3, 19, 53, 1));
-        assert_eq!(layout.switch, Rect::new(3, 20, 53, 1));
-        assert_eq!(layout.quit, Rect::new(3, 21, 53, 1));
+        assert_eq!(layout.grid, Rect::new(7, 5, 13, 9));
+        assert_eq!(layout.outputs, Rect::new(23, 2, 28, 15));
+        assert_eq!(layout.help, Rect::new(0, 18, 59, 2));
+        assert_eq!(layout.quit, Rect::new(0, 20, 59, 1));
+    }
+
+    #[test]
+    fn hints_wrap_only_between_whole_segments_and_keep_hotkey_colors() {
+        for mode in [GridMode::Octants, GridMode::Sixteenths, GridMode::Eighths] {
+            let segments = help_segments(mode);
+            let expected: Vec<_> = segments.iter().map(ToString::to_string).collect();
+            let combined = expected.join(" • ");
+            let full_width = Line::from(combined.as_str()).width() as u16;
+            assert_eq!(key_hints(mode, full_width).text.to_string(), combined);
+            assert_eq!(key_hints(mode, full_width).text.height(), 1);
+            assert!(key_hints(mode, full_width - 1).text.height() > 1);
+            for width in mode.minimum_width()..=full_width {
+                let hints = key_hints(mode, width);
+                assert!(hints.text.width() <= usize::from(width));
+                let actual: Vec<_> = hints
+                    .text
+                    .lines
+                    .iter()
+                    .flat_map(|line| {
+                        let line = line.to_string();
+                        assert!(!line.starts_with('•') && !line.ends_with('•'));
+                        line.split(" • ").map(str::to_owned).collect::<Vec<_>>()
+                    })
+                    .collect();
+                assert_eq!(actual, expected);
+                let highlighted: String = hints
+                    .text
+                    .lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .filter(|span| span.style.fg == Some(HOTKEY_COLOR))
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                assert_eq!(
+                    highlighted,
+                    format!("{}angtab", mode.copy_hotkeys().replace('/', "")),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codepoint_column_disappears_only_when_the_body_needs_less_width() {
+        for mode in [GridMode::Octants, GridMode::Sixteenths, GridMode::Eighths] {
+            let full_width = mode.grid_width() + GRID_OUTPUT_GAP + output_width(true);
+            let full = AppLayout::new(Rect::new(0, 0, full_width, 30), mode).unwrap();
+            assert!(full.show_codepoints);
+            assert!(full.help.height > 1);
+            let narrow = AppLayout::new(Rect::new(0, 0, full_width - 1, 30), mode).unwrap();
+            assert!(!narrow.show_codepoints);
+            assert_eq!(full.outputs.width - narrow.outputs.width, 9);
+        }
+        let glyph_style = Style::default().fg(GLYPH_COLOR).bg(Color::Indexed(8));
+        for text in [
+            exact_outputs_text(0x08, glyph_style, false),
+            sixteenth_outputs_text(0x0003, glyph_style, false),
+            eighth_outputs_text(0x1010_1010_1010_1010, glyph_style, false),
+            scaled_outputs_text(&cells_from_mask(0x81), glyph_style, false),
+        ] {
+            assert!(!text.to_string().contains("U+"));
+            assert!(text.width() <= usize::from(output_width(false) - 2));
+            assert!(
+                text.lines
+                    .iter()
+                    .any(|line| { line.spans.iter().any(|span| span.style == glyph_style) })
+            );
+        }
+        let unsupported = sixteenth_outputs_text(0x1001, glyph_style, false);
+        assert!(unsupported.width() <= usize::from(output_width(false) - 2));
+    }
+
+    #[test]
+    fn wrapped_footer_hitboxes_track_the_rendered_all_and_none_words() {
+        for mode in [GridMode::Octants, GridMode::Sixteenths, GridMode::Eighths] {
+            for width in mode.minimum_width()..=80 {
+                let backend = ratatui::backend::TestBackend::new(width, 30);
+                let mut terminal = ratatui::Terminal::new(backend).unwrap();
+                let mut app = App {
+                    mode,
+                    ..App::new(false)
+                };
+                terminal.draw(|frame| app.render(frame)).unwrap();
+                let buffer = terminal.backend().buffer();
+                for (area, word) in [
+                    (app.select_all_area.unwrap(), "all"),
+                    (app.select_none_area.unwrap(), "none"),
+                ] {
+                    let rendered: String = (area.x..area.right())
+                        .map(|x| buffer[(x, area.y)].symbol())
+                        .collect();
+                    assert_eq!(rendered, word, "mode {mode:?}, width {width}");
+                    app.handle_mouse(MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: area.x,
+                        row: area.y,
+                        modifiers: KeyModifiers::NONE,
+                    });
+                    let selected = match mode {
+                        GridMode::Octants => cells_mask(&app.cells),
+                        GridMode::Sixteenths => cells_mask(&app.sixteenth_cells),
+                        GridMode::Eighths => cells_mask(&app.eighth_cells),
+                    };
+                    let expected = match (word, mode) {
+                        ("all", GridMode::Octants) => 0xFF,
+                        ("all", GridMode::Sixteenths) => 0xFFFF,
+                        ("all", GridMode::Eighths) => u64::MAX,
+                        _ => 0,
+                    };
+                    assert_eq!(selected, expected);
+                }
+            }
+        }
     }
 }
