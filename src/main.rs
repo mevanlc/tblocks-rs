@@ -111,9 +111,9 @@ fn main() -> io::Result<()> {
 
 #[derive(Default)]
 struct App {
-    cells: [[bool; 2]; 4],
-    sixteenth_cells: [[bool; 4]; 4],
-    eighth_cells: [[bool; 8]; 8],
+    octants: SelectionCanvas<2, 4>,
+    sixteenths: SelectionCanvas<4, 4>,
+    eighths: SelectionCanvas<8, 8>,
     mode: GridMode,
     scaling: bool,
     glyph_background: bool,
@@ -123,6 +123,76 @@ struct App {
     draw_stroke: Option<DrawStroke>,
     wheel_cursor: Option<WheelCursor>,
     should_quit: bool,
+}
+
+struct SelectionCanvas<const COLUMNS: usize, const ROWS: usize> {
+    cells: Vec<bool>,
+    top: usize,
+    left: usize,
+}
+
+impl<const COLUMNS: usize, const ROWS: usize> Default for SelectionCanvas<COLUMNS, ROWS> {
+    fn default() -> Self {
+        let (top, left) = Self::CENTER;
+        Self {
+            cells: vec![false; Self::WIDTH * Self::HEIGHT],
+            top,
+            left,
+        }
+    }
+}
+
+impl<const COLUMNS: usize, const ROWS: usize> SelectionCanvas<COLUMNS, ROWS> {
+    const WIDTH: usize = COLUMNS * 16;
+    const HEIGHT: usize = ROWS * 16;
+    const CENTER: (usize, usize) = ((Self::HEIGHT - ROWS) / 2, (Self::WIDTH - COLUMNS) / 2);
+
+    fn index(&self, row: usize, column: usize) -> usize {
+        (self.top + row) * Self::WIDTH + self.left + column
+    }
+
+    fn cell_mut(&mut self, row: usize, column: usize) -> &mut bool {
+        let index = self.index(row, column);
+        &mut self.cells[index]
+    }
+
+    fn visible(&self) -> [[bool; COLUMNS]; ROWS] {
+        std::array::from_fn(|row| std::array::from_fn(|column| self.cells[self.index(row, column)]))
+    }
+
+    fn mask(&self) -> u64 {
+        cells_mask(&self.visible())
+    }
+
+    fn replace_visible(&mut self, mask: u64) {
+        for (row, cells) in cells_from_mask::<COLUMNS, ROWS>(mask)
+            .into_iter()
+            .enumerate()
+        {
+            let start = self.index(row, 0);
+            self.cells[start..start + COLUMNS].copy_from_slice(&cells);
+        }
+    }
+
+    fn reset(&mut self, filled: bool) {
+        self.cells.fill(false);
+        (self.top, self.left) = Self::CENTER;
+        if filled {
+            self.replace_visible(u64::MAX);
+        }
+    }
+
+    fn shift(&mut self, row_delta: isize, column_delta: isize) {
+        // Move the viewport opposite the requested tile movement.
+        self.top = self
+            .top
+            .saturating_add_signed(-row_delta)
+            .min(Self::HEIGHT - ROWS);
+        self.left = self
+            .left
+            .saturating_add_signed(-column_delta)
+            .min(Self::WIDTH - COLUMNS);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -186,35 +256,38 @@ impl App {
         self.select_all_area = Some(layout.select_all);
         self.select_none_area = Some(layout.select_none);
 
-        match self.mode {
-            GridMode::Octants => frame.render_widget(CellGrid::new(&self.cells), layout.grid),
-            GridMode::Sixteenths => {
-                frame.render_widget(CellGrid::new(&self.sixteenth_cells), layout.grid);
-            }
-            GridMode::Eighths => {
-                frame.render_widget(CellGrid::new(&self.eighth_cells), layout.grid);
-            }
-        }
         let mut glyph_style = Style::default().fg(GLYPH_COLOR);
         if self.glyph_background {
             glyph_style = glyph_style.bg(Color::Indexed(8));
         }
-        let output_text = if self.mode == GridMode::Eighths {
-            eighth_outputs_text(
-                cells_mask(&self.eighth_cells),
-                glyph_style,
-                layout.show_codepoints,
-            )
-        } else if self.mode == GridMode::Sixteenths {
-            sixteenth_outputs_text(
-                cells_mask(&self.sixteenth_cells) as u16,
-                glyph_style,
-                layout.show_codepoints,
-            )
-        } else if self.scaling {
-            scaled_outputs_text(&self.cells, glyph_style, layout.show_codepoints)
-        } else {
-            exact_outputs_text(self.mask(), glyph_style, layout.show_codepoints)
+        let output_text = match self.mode {
+            GridMode::Octants => {
+                let cells = self.octants.visible();
+                frame.render_widget(CellGrid::new(&cells), layout.grid);
+                if self.scaling {
+                    scaled_outputs_text(&cells, glyph_style, layout.show_codepoints)
+                } else {
+                    exact_outputs_text(
+                        cells_mask(&cells) as u8,
+                        glyph_style,
+                        layout.show_codepoints,
+                    )
+                }
+            }
+            GridMode::Sixteenths => {
+                let cells = self.sixteenths.visible();
+                frame.render_widget(CellGrid::new(&cells), layout.grid);
+                sixteenth_outputs_text(
+                    cells_mask(&cells) as u16,
+                    glyph_style,
+                    layout.show_codepoints,
+                )
+            }
+            GridMode::Eighths => {
+                let cells = self.eighths.visible();
+                frame.render_widget(CellGrid::new(&cells), layout.grid);
+                eighth_outputs_text(cells_mask(&cells), glyph_style, layout.show_codepoints)
+            }
         };
         let block = Block::new().borders(Borders::ALL);
         let mut output_area = block.inner(layout.outputs);
@@ -235,11 +308,13 @@ impl App {
         );
         frame.render_widget(
             Paragraph::new(Line::from(vec![
+                Span::styled("Shift+Arrows", Style::default().fg(HOTKEY_COLOR)),
+                Span::raw(" move • "),
                 Span::styled("esc", Style::default().fg(HOTKEY_COLOR)),
                 Span::raw(" quit"),
             ]))
             .alignment(Alignment::Center),
-            layout.quit,
+            layout.footer,
         );
     }
 
@@ -249,7 +324,25 @@ impl App {
             self.draw_stroke = None;
         }
         match event {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
+            Event::Key(key) => {
+                if key.modifiers == KeyModifiers::SHIFT
+                    && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                {
+                    let delta = match key.code {
+                        KeyCode::Up => Some((-1, 0)),
+                        KeyCode::Down => Some((1, 0)),
+                        KeyCode::Left => Some((0, -1)),
+                        KeyCode::Right => Some((0, 1)),
+                        _ => None,
+                    };
+                    if let Some((row, column)) = delta {
+                        self.shift_selection(row, column);
+                        return None;
+                    }
+                }
+                if key.kind != KeyEventKind::Press {
+                    return None;
+                }
                 let ctrl_c =
                     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
                 if key.code == KeyCode::Esc || ctrl_c {
@@ -271,11 +364,11 @@ impl App {
                         return Some(braille_glyph(self.mask()));
                     }
                     let outputs = if self.mode == GridMode::Eighths {
-                        eighth_outputs(cells_mask(&self.eighth_cells))
+                        eighth_outputs(self.eighths.mask())
                     } else if self.mode == GridMode::Sixteenths {
-                        sixteenth_outputs(cells_mask(&self.sixteenth_cells) as u16)
+                        sixteenth_outputs(self.sixteenths.mask() as u16)
                     } else if self.scaling {
-                        scaled_outputs(&self.cells)
+                        scaled_outputs(&self.octants.visible())
                     } else {
                         exact_outputs(self.mask())
                     };
@@ -420,7 +513,7 @@ impl App {
     }
 
     fn mask(&self) -> u8 {
-        cells_mask(&self.cells) as u8
+        self.octants.mask() as u8
     }
 
     fn load_glyph(&mut self, glyph: char) {
@@ -431,28 +524,36 @@ impl App {
         if self.mode == GridMode::Eighths
             && let Some(mask) = eighths
         {
-            self.eighth_cells = cells_from_mask(mask);
+            self.eighths.replace_visible(mask);
         } else if self.mode == GridMode::Sixteenths
             && let Some(mask) = sixteenths
         {
-            self.sixteenth_cells = cells_from_mask(u64::from(mask));
+            self.sixteenths.replace_visible(u64::from(mask));
         } else if let Some(mask) = octants {
             self.mode = GridMode::Octants;
-            self.cells = cells_from_mask(u64::from(mask));
+            self.octants.replace_visible(u64::from(mask));
         } else if let Some(mask) = sixteenths {
             self.mode = GridMode::Sixteenths;
-            self.sixteenth_cells = cells_from_mask(u64::from(mask));
+            self.sixteenths.replace_visible(u64::from(mask));
         } else if let Some(mask) = eighths {
             self.mode = GridMode::Eighths;
-            self.eighth_cells = cells_from_mask(mask);
+            self.eighths.replace_visible(mask);
         }
     }
 
     fn set_all(&mut self, filled: bool) {
         match self.mode {
-            GridMode::Octants => self.cells.fill([filled; 2]),
-            GridMode::Sixteenths => self.sixteenth_cells.fill([filled; 4]),
-            GridMode::Eighths => self.eighth_cells.fill([filled; 8]),
+            GridMode::Octants => self.octants.reset(filled),
+            GridMode::Sixteenths => self.sixteenths.reset(filled),
+            GridMode::Eighths => self.eighths.reset(filled),
+        }
+    }
+
+    fn shift_selection(&mut self, row_delta: isize, column_delta: isize) {
+        match self.mode {
+            GridMode::Octants => self.octants.shift(row_delta, column_delta),
+            GridMode::Sixteenths => self.sixteenths.shift(row_delta, column_delta),
+            GridMode::Eighths => self.eighths.shift(row_delta, column_delta),
         }
     }
 
@@ -463,9 +564,9 @@ impl App {
 
     fn cell_mut(&mut self, row: usize, column: usize) -> &mut bool {
         match self.mode {
-            GridMode::Octants => &mut self.cells[row][column],
-            GridMode::Sixteenths => &mut self.sixteenth_cells[row][column],
-            GridMode::Eighths => &mut self.eighth_cells[row][column],
+            GridMode::Octants => self.octants.cell_mut(row, column),
+            GridMode::Sixteenths => self.sixteenths.cell_mut(row, column),
+            GridMode::Eighths => self.eighths.cell_mut(row, column),
         }
     }
 }
@@ -859,7 +960,7 @@ struct AppLayout {
     outputs: Rect,
     help: Rect,
     help_text: Text<'static>,
-    quit: Rect,
+    footer: Rect,
     show_codepoints: bool,
 }
 
@@ -913,7 +1014,7 @@ impl AppLayout {
             ),
             help,
             help_text: hints.text,
-            quit: Rect::new(area.x, y + height - 1, area.width, 1),
+            footer: Rect::new(area.x, y + height - 1, area.width, 1),
             show_codepoints,
         })
     }
@@ -1140,10 +1241,58 @@ mod tests {
 
     fn active_mask(app: &App) -> u64 {
         match app.mode {
-            GridMode::Octants => cells_mask(&app.cells),
-            GridMode::Sixteenths => cells_mask(&app.sixteenth_cells),
-            GridMode::Eighths => cells_mask(&app.eighth_cells),
+            GridMode::Octants => app.octants.mask(),
+            GridMode::Sixteenths => app.sixteenths.mask(),
+            GridMode::Eighths => app.eighths.mask(),
         }
+    }
+
+    fn shift_arrow(code: KeyCode) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::SHIFT))
+    }
+
+    #[test]
+    fn shift_arrows_recover_tiles_clipped_by_the_viewport() {
+        for (mode, columns) in [
+            (GridMode::Octants, 2),
+            (GridMode::Sixteenths, 4),
+            (GridMode::Eighths, 8),
+        ] {
+            let mut app = App {
+                mode,
+                ..App::default()
+            };
+            app.toggle_cell(0, 0);
+            app.toggle_cell(1, columns - 1);
+            let initial = 1 | (1 << (2 * columns - 1));
+            let moved_down = initial << columns;
+            for (arrow, expected) in [
+                (KeyCode::Down, moved_down),
+                (KeyCode::Right, 1 << (columns + 1)),
+                (KeyCode::Left, moved_down),
+                (KeyCode::Up, initial),
+            ] {
+                app.handle_event(shift_arrow(arrow));
+                assert_eq!(active_mask(&app), expected, "{mode:?}, {arrow:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn viewport_starts_centered_and_stops_at_each_canvas_edge() {
+        let mut canvas = SelectionCanvas::<2, 4>::default();
+        assert_eq!(canvas.cells.len(), 32 * 64);
+        assert_eq!((canvas.top, canvas.left), (30, 15));
+        canvas.replace_visible(0b1001);
+
+        canvas.shift(100, 100);
+        assert_eq!((canvas.top, canvas.left), (0, 0));
+        assert_eq!(canvas.mask(), 0);
+        canvas.shift(-100, -100);
+        assert_eq!((canvas.top, canvas.left), (60, 30));
+        assert_eq!(canvas.mask(), 0);
+        canvas.shift(30, 15);
+        assert_eq!(canvas.mask(), 0b1001);
     }
 
     #[test]
@@ -1445,9 +1594,9 @@ mod tests {
     #[test]
     fn mask_uses_row_major_octant_numbering() {
         let mut app = App::default();
-        app.cells[0][0] = true;
-        app.cells[1][1] = true;
-        app.cells[3][1] = true;
+        *app.octants.cell_mut(0, 0) = true;
+        *app.octants.cell_mut(1, 1) = true;
+        *app.octants.cell_mut(3, 1) = true;
 
         assert_eq!(app.mask(), 0b1000_1001);
     }
@@ -1537,7 +1686,7 @@ mod tests {
     #[test]
     fn paste_requires_one_supported_glyph_and_preserves_blank_characters() {
         let mut app = App::default();
-        app.cells[3][1] = true;
+        *app.octants.cell_mut(3, 1) = true;
 
         for text in [
             "",
@@ -1652,7 +1801,7 @@ mod tests {
             (true, '▐', '▐', '\u{1CC2A}', '\u{1CE7A}'),
         ] {
             let mut app = App::new(scaling);
-            app.cells[1][1] = true;
+            *app.octants.cell_mut(1, 1) = true;
             for (hotkey, expected) in [
                 ('b', '\u{2810}'),
                 ('q', quadrant),
@@ -1682,7 +1831,7 @@ mod tests {
         }
 
         let mut app = App::new(false);
-        app.cells[3][0] = true;
+        *app.octants.cell_mut(3, 0) = true;
         for hotkey in ['q', 'Q', 's', 'S'] {
             assert_eq!(
                 app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
@@ -1699,7 +1848,7 @@ mod tests {
     fn tab_preserves_each_grids_selection_and_sixteenths_copy_exactly() {
         for scaling in [false, true] {
             let mut app = App::new(scaling);
-            app.cells[1][1] = true;
+            *app.octants.cell_mut(1, 1) = true;
             let tab = Event::Key(crossterm::event::KeyEvent::new(
                 KeyCode::Tab,
                 KeyModifiers::NONE,
@@ -1723,8 +1872,8 @@ mod tests {
             assert_eq!(app.mask(), 0x08);
             app.handle_event(tab);
             assert_eq!(app.mode, GridMode::Sixteenths);
-            assert_eq!(cells_mask(&app.sixteenth_cells), 0x3000);
-            assert_eq!(cells_mask(&app.eighth_cells), 1 << 63);
+            assert_eq!(app.sixteenths.mask(), 0x3000);
+            assert_eq!(app.eighths.mask(), 1 << 63);
 
             app.set_all(true);
             assert_eq!(app.handle_event(copy.clone()), Some('█'));
@@ -1734,13 +1883,9 @@ mod tests {
             app.toggle_cell(3, 0);
             assert_eq!(app.handle_event(copy), None);
             assert!(
-                sixteenth_outputs_text(
-                    cells_mask(&app.sixteenth_cells) as u16,
-                    Style::default(),
-                    true
-                )
-                .to_string()
-                .contains("No single Unicode glyph")
+                sixteenth_outputs_text(app.sixteenths.mask() as u16, Style::default(), true)
+                    .to_string()
+                    .contains("No single Unicode glyph")
             );
             assert_eq!(app.mask(), 0x08);
             assert!(!app.should_quit);
@@ -1792,11 +1937,11 @@ mod tests {
     fn four_by_four_copy_hotkeys_copy_the_visible_matching_categories() {
         for scaling in [false, true] {
             let mut app = App {
-                cells: [[true; 2]; 4],
-                sixteenth_cells: cells_from_mask(0x00F0),
                 mode: GridMode::Sixteenths,
                 ..App::new(scaling)
             };
+            app.octants.reset(true);
+            app.sixteenths.replace_visible(0x00F0);
             for (hotkey, expected) in [
                 ('b', '⠒'),
                 ('q', '▄'),
@@ -1820,7 +1965,7 @@ mod tests {
                 );
             }
 
-            app.sixteenth_cells = cells_from_mask(0x1000);
+            app.sixteenths.replace_visible(0x1000);
             for hotkey in ['b', 'q', 'Q', 's', 'S', 'c'] {
                 assert_eq!(
                     app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
@@ -1830,7 +1975,7 @@ mod tests {
                     None,
                 );
             }
-            assert_eq!(cells_mask(&app.sixteenth_cells), 0x1000);
+            assert_eq!(app.sixteenths.mask(), 0x1000);
             assert_eq!(app.mask(), 0xFF);
         }
     }
@@ -1848,22 +1993,22 @@ mod tests {
             app.mode = GridMode::Octants;
             app.handle_event(event);
             assert_eq!(app.mode, GridMode::Sixteenths);
-            assert_eq!(cells_mask(&app.sixteenth_cells), 0x1000);
+            assert_eq!(app.sixteenths.mask(), 0x1000);
         }
 
         app.handle_event(Event::Paste("\u{1CEA3}".to_owned()));
         assert_eq!(app.mode, GridMode::Sixteenths);
-        assert_eq!(cells_mask(&app.sixteenth_cells), 0x3000);
+        assert_eq!(app.sixteenths.mask(), 0x3000);
         app.handle_event(Event::Paste("▗".to_owned()));
         assert_eq!(app.mode, GridMode::Sixteenths);
-        assert_eq!(cells_mask(&app.sixteenth_cells), 0xCC00);
+        assert_eq!(app.sixteenths.mask(), 0xCC00);
         app.handle_event(Event::Paste("\u{2810}".to_owned()));
         assert_eq!(app.mode, GridMode::Octants);
         assert_eq!(app.mask(), 0x08);
         app.handle_event(Event::Paste("\u{1CEA3}".to_owned()));
         assert_eq!(app.mode, GridMode::Octants);
         assert_eq!(app.mask(), 0x40);
-        assert_eq!(cells_mask(&app.sixteenth_cells), 0xCC00);
+        assert_eq!(app.sixteenths.mask(), 0xCC00);
     }
 
     #[test]
@@ -1910,10 +2055,10 @@ mod tests {
             });
             assert_eq!(eighth_outputs(expanded), outputs);
             let mut app = App {
-                eighth_cells: cells_from_mask(expanded),
                 mode: GridMode::Eighths,
                 ..App::new(scaling)
             };
+            app.eighths.replace_visible(expanded);
             let key = |hotkey| {
                 Event::Key(crossterm::event::KeyEvent::new(
                     KeyCode::Char(hotkey),
@@ -1927,7 +2072,7 @@ mod tests {
             for output in outputs {
                 assert_eq!(app.handle_event(key(output.hotkey)), Some(output.glyph));
             }
-            app.eighth_cells = cells_from_mask(0x1010_1010_1010_1010);
+            app.eighths.replace_visible(0x1010_1010_1010_1010);
             assert_eq!(app.handle_event(key('k')), Some('\u{1FB73}'));
             for hotkey in ['b', 'q', 'Q', 's', 'S', 'c', 't'] {
                 assert_eq!(app.handle_event(key(hotkey)), None);
@@ -1935,15 +2080,15 @@ mod tests {
             app.toggle_cell(0, 4);
             assert_eq!(app.handle_event(key('k')), None);
             assert!(
-                eighth_outputs_text(cells_mask(&app.eighth_cells), Style::default(), true)
+                eighth_outputs_text(app.eighths.mask(), Style::default(), true)
                     .to_string()
                     .contains("No single Unicode glyph")
             );
             app.handle_event(key('a'));
-            assert_eq!(cells_mask(&app.eighth_cells), u64::MAX);
+            assert_eq!(app.eighths.mask(), u64::MAX);
             assert_eq!(app.handle_event(key('k')), Some('█'));
             app.handle_event(key('n'));
-            assert_eq!(cells_mask(&app.eighth_cells), 0);
+            assert_eq!(app.eighths.mask(), 0);
             assert_eq!(app.handle_event(key('k')), Some('\u{00A0}'));
         }
     }
@@ -1967,13 +2112,13 @@ mod tests {
                 app.mode = GridMode::Octants;
                 app.handle_event(event);
                 assert_eq!(app.mode, GridMode::Eighths);
-                assert_eq!(cells_mask(&app.eighth_cells), expected);
+                assert_eq!(app.eighths.mask(), expected);
             }
         }
         for glyph in ['\u{1CE9C}', '▗', '█', ' ', '\u{00A0}'] {
             app.handle_event(Event::Paste(glyph.to_string()));
             assert_eq!(app.mode, GridMode::Eighths);
-            assert_eq!(cells_mask(&app.eighth_cells), eighths::mask(glyph).unwrap());
+            assert_eq!(app.eighths.mask(), eighths::mask(glyph).unwrap());
         }
         app.handle_event(Event::Paste("\u{2810}".to_owned()));
         assert_eq!(app.mode, GridMode::Octants);
@@ -2004,9 +2149,9 @@ mod tests {
                 });
             }
         }
-        assert_eq!(cells_mask(&app.eighth_cells), u64::MAX);
+        assert_eq!(app.eighths.mask(), u64::MAX);
         let mut buffer = Buffer::empty(grid);
-        CellGrid::new(&app.eighth_cells).render(grid, &mut buffer);
+        CellGrid::new(&app.eighths.visible()).render(grid, &mut buffer);
         for row in 0..8 {
             for column in 0..8 {
                 for offset in [1, 2] {
@@ -2059,6 +2204,8 @@ mod tests {
     fn selection_hotkeys_fill_and_clear_partial_grids() {
         let mut app = App::default();
         for hotkey in ['a', 'a', 'n', 'n'] {
+            app.handle_event(shift_arrow(KeyCode::Down));
+            *app.cell_mut(0, 1) = true;
             app.toggle_cell(2, 1);
             assert_eq!(
                 app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
@@ -2067,12 +2214,12 @@ mod tests {
                 ))),
                 None,
             );
-            assert!(
-                app.cells
-                    .iter()
-                    .flatten()
-                    .all(|cell| *cell == (hotkey == 'a'))
-            );
+            let expected = if hotkey == 'a' { u8::MAX } else { 0 };
+            assert_eq!(app.mask(), expected);
+            assert_eq!((app.octants.top, app.octants.left), (30, 15));
+            app.handle_event(shift_arrow(KeyCode::Down));
+            assert_eq!(app.mask(), expected << 2);
+            app.handle_event(shift_arrow(KeyCode::Up));
         }
     }
 
@@ -2085,6 +2232,8 @@ mod tests {
             ..App::default()
         };
         for (area, filled) in [(layout.select_all, true), (layout.select_none, false)] {
+            app.handle_event(shift_arrow(KeyCode::Right));
+            *app.cell_mut(0, 0) = true;
             app.toggle_cell(2, 1);
             app.handle_mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
@@ -2092,7 +2241,12 @@ mod tests {
                 row: area.y,
                 modifiers: KeyModifiers::NONE,
             });
-            assert!(app.cells.iter().flatten().all(|cell| *cell == filled));
+            let expected = if filled { u8::MAX } else { 0 };
+            assert_eq!(app.mask(), expected);
+            assert_eq!((app.octants.top, app.octants.left), (30, 15));
+            app.handle_event(shift_arrow(KeyCode::Right));
+            assert_eq!(app.mask(), expected & 0b1010_1010);
+            app.handle_event(shift_arrow(KeyCode::Left));
         }
     }
 
@@ -2161,7 +2315,7 @@ mod tests {
         assert_eq!(layout.select_none, Rect::new(36, 17, 4, 1));
         assert_eq!(layout.outputs, Rect::new(20, 3, 28, 13));
         assert_eq!(layout.help, Rect::new(0, 17, 59, 2));
-        assert_eq!(layout.quit, Rect::new(0, 19, 59, 1));
+        assert_eq!(layout.footer, Rect::new(0, 19, 59, 1));
         for (mode, width, height, hint_rows) in [
             (GridMode::Octants, 29, 18, 3),
             (GridMode::Sixteenths, 35, 20, 3),
@@ -2172,13 +2326,13 @@ mod tests {
             let layout = AppLayout::new(Rect::new(0, 0, width, height), mode).unwrap();
             assert!(!layout.show_codepoints);
             assert_eq!(layout.help.height, hint_rows);
-            assert_eq!(layout.quit.bottom(), height);
+            assert_eq!(layout.footer.bottom(), height);
         }
         let layout = AppLayout::new(Rect::new(0, 0, 59, 23), GridMode::Sixteenths).unwrap();
         assert_eq!(layout.grid, Rect::new(7, 5, 13, 9));
         assert_eq!(layout.outputs, Rect::new(23, 2, 28, 15));
         assert_eq!(layout.help, Rect::new(0, 18, 59, 2));
-        assert_eq!(layout.quit, Rect::new(0, 20, 59, 1));
+        assert_eq!(layout.footer, Rect::new(0, 20, 59, 1));
     }
 
     #[test]
@@ -2277,11 +2431,7 @@ mod tests {
                         row: area.y,
                         modifiers: KeyModifiers::NONE,
                     });
-                    let selected = match mode {
-                        GridMode::Octants => cells_mask(&app.cells),
-                        GridMode::Sixteenths => cells_mask(&app.sixteenth_cells),
-                        GridMode::Eighths => cells_mask(&app.eighth_cells),
-                    };
+                    let selected = active_mask(&app);
                     let expected = match (word, mode) {
                         ("all", GridMode::Octants) => 0xFF,
                         ("all", GridMode::Sixteenths) => 0xFFFF,
